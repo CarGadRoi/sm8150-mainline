@@ -1809,8 +1809,8 @@ static void print_bpf_prog_info(struct feat_fd *ff, FILE *fp)
 		node = rb_entry(next, struct bpf_prog_info_node, rb_node);
 		next = rb_next(&node->rb_node);
 
-		bpf_event__print_bpf_prog_info(&node->info_linear->info,
-					       env, fp);
+		__bpf_event__print_bpf_prog_info(&node->info_linear->info,
+						 env, fp);
 	}
 
 	up_read(&env->bpf_progs.lock);
@@ -3136,7 +3136,7 @@ static int process_bpf_prog_info(struct feat_fd *ff, void *data __maybe_unused)
 		/* after reading from file, translate offset to address */
 		bpil_offs_to_addr(info_linear);
 		info_node->info_linear = info_linear;
-		perf_env__insert_bpf_prog_info(env, info_node);
+		__perf_env__insert_bpf_prog_info(env, info_node);
 	}
 
 	up_write(&env->bpf_progs.lock);
@@ -3183,7 +3183,7 @@ static int process_bpf_btf(struct feat_fd *ff, void *data __maybe_unused)
 		if (__do_read(ff, node->data, data_size))
 			goto out;
 
-		perf_env__insert_btf(env, node);
+		__perf_env__insert_btf(env, node);
 		node = NULL;
 	}
 
@@ -4295,8 +4295,6 @@ out:
 size_t perf_event__fprintf_event_update(union perf_event *event, FILE *fp)
 {
 	struct perf_record_event_update *ev = &event->event_update;
-	struct perf_record_event_update_scale *ev_scale;
-	struct perf_record_event_update_cpus *ev_cpus;
 	struct perf_cpu_map *map;
 	size_t ret;
 
@@ -4304,23 +4302,22 @@ size_t perf_event__fprintf_event_update(union perf_event *event, FILE *fp)
 
 	switch (ev->type) {
 	case PERF_EVENT_UPDATE__SCALE:
-		ev_scale = (struct perf_record_event_update_scale *)ev->data;
-		ret += fprintf(fp, "... scale: %f\n", ev_scale->scale);
+		ret += fprintf(fp, "... scale: %f\n", ev->scale.scale);
 		break;
 	case PERF_EVENT_UPDATE__UNIT:
-		ret += fprintf(fp, "... unit:  %s\n", ev->data);
+		ret += fprintf(fp, "... unit:  %s\n", ev->unit);
 		break;
 	case PERF_EVENT_UPDATE__NAME:
-		ret += fprintf(fp, "... name:  %s\n", ev->data);
+		ret += fprintf(fp, "... name:  %s\n", ev->name);
 		break;
 	case PERF_EVENT_UPDATE__CPUS:
-		ev_cpus = (struct perf_record_event_update_cpus *)ev->data;
 		ret += fprintf(fp, "... ");
 
-		map = cpu_map__new_data(&ev_cpus->cpus);
-		if (map)
+		map = cpu_map__new_data(&ev->cpus.cpus);
+		if (map) {
 			ret += cpu_map__fprintf(map, fp);
-		else
+			perf_cpu_map__put(map);
+		} else
 			ret += fprintf(fp, "failed to get cpus\n");
 		break;
 	default:
@@ -4335,7 +4332,8 @@ int perf_event__process_attr(struct perf_tool *tool __maybe_unused,
 			     union perf_event *event,
 			     struct evlist **pevlist)
 {
-	u32 i, ids, n_ids;
+	u32 i, n_ids;
+	u64 *ids;
 	struct evsel *evsel;
 	struct evlist *evlist = *pevlist;
 
@@ -4351,9 +4349,8 @@ int perf_event__process_attr(struct perf_tool *tool __maybe_unused,
 
 	evlist__add(evlist, evsel);
 
-	ids = event->header.size;
-	ids -= (void *)&event->attr.id - (void *)event;
-	n_ids = ids / sizeof(u64);
+	n_ids = event->header.size - sizeof(event->header) - event->attr.attr.size;
+	n_ids = n_ids / sizeof(u64);
 	/*
 	 * We don't have the cpu and thread maps on the header, so
 	 * for allocating the perf_sample_id table we fake 1 cpu and
@@ -4362,8 +4359,9 @@ int perf_event__process_attr(struct perf_tool *tool __maybe_unused,
 	if (perf_evsel__alloc_id(&evsel->core, 1, n_ids))
 		return -ENOMEM;
 
+	ids = (void *)&event->attr.attr + event->attr.attr.size;
 	for (i = 0; i < n_ids; i++) {
-		perf_evlist__id_add(&evlist->core, &evsel->core, 0, i, event->attr.id[i]);
+		perf_evlist__id_add(&evlist->core, &evsel->core, 0, i, ids[i]);
 	}
 
 	return 0;
@@ -4374,8 +4372,6 @@ int perf_event__process_event_update(struct perf_tool *tool __maybe_unused,
 				     struct evlist **pevlist)
 {
 	struct perf_record_event_update *ev = &event->event_update;
-	struct perf_record_event_update_scale *ev_scale;
-	struct perf_record_event_update_cpus *ev_cpus;
 	struct evlist *evlist;
 	struct evsel *evsel;
 	struct perf_cpu_map *map;
@@ -4395,19 +4391,17 @@ int perf_event__process_event_update(struct perf_tool *tool __maybe_unused,
 	switch (ev->type) {
 	case PERF_EVENT_UPDATE__UNIT:
 		free((char *)evsel->unit);
-		evsel->unit = strdup(ev->data);
+		evsel->unit = strdup(ev->unit);
 		break;
 	case PERF_EVENT_UPDATE__NAME:
 		free(evsel->name);
-		evsel->name = strdup(ev->data);
+		evsel->name = strdup(ev->name);
 		break;
 	case PERF_EVENT_UPDATE__SCALE:
-		ev_scale = (struct perf_record_event_update_scale *)ev->data;
-		evsel->scale = ev_scale->scale;
+		evsel->scale = ev->scale.scale;
 		break;
 	case PERF_EVENT_UPDATE__CPUS:
-		ev_cpus = (struct perf_record_event_update_cpus *)ev->data;
-		map = cpu_map__new_data(&ev_cpus->cpus);
+		map = cpu_map__new_data(&ev->cpus.cpus);
 		if (map) {
 			perf_cpu_map__put(evsel->core.own_cpus);
 			evsel->core.own_cpus = map;

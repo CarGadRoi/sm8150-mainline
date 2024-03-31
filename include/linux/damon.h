@@ -8,6 +8,7 @@
 #ifndef _DAMON_H_
 #define _DAMON_H_
 
+#include <linux/completion.h>
 #include <linux/mutex.h>
 #include <linux/time64.h>
 #include <linux/types.h>
@@ -216,13 +217,26 @@ struct damos_stat {
 };
 
 /**
- * struct damos - Represents a Data Access Monitoring-based Operation Scheme.
+ * struct damos_access_pattern - Target access pattern of the given scheme.
  * @min_sz_region:	Minimum size of target regions.
  * @max_sz_region:	Maximum size of target regions.
  * @min_nr_accesses:	Minimum ``->nr_accesses`` of target regions.
  * @max_nr_accesses:	Maximum ``->nr_accesses`` of target regions.
  * @min_age_region:	Minimum age of target regions.
  * @max_age_region:	Maximum age of target regions.
+ */
+struct damos_access_pattern {
+	unsigned long min_sz_region;
+	unsigned long max_sz_region;
+	unsigned int min_nr_accesses;
+	unsigned int max_nr_accesses;
+	unsigned int min_age_region;
+	unsigned int max_age_region;
+};
+
+/**
+ * struct damos - Represents a Data Access Monitoring-based Operation Scheme.
+ * @pattern:		Access pattern of target regions.
  * @action:		&damo_action to be applied to the target regions.
  * @quota:		Control the aggressiveness of this scheme.
  * @wmarks:		Watermarks for automated (in)activation of this scheme.
@@ -230,10 +244,8 @@ struct damos_stat {
  * @list:		List head for siblings.
  *
  * For each aggregation interval, DAMON finds regions which fit in the
- * condition (&min_sz_region, &max_sz_region, &min_nr_accesses,
- * &max_nr_accesses, &min_age_region, &max_age_region) and applies &action to
- * those.  To avoid consuming too much CPU time or IO resources for the
- * &action, &quota is used.
+ * &pattern and applies &action to those. To avoid consuming too much
+ * CPU time or IO resources for the &action, &quota is used.
  *
  * To do the work only when needed, schemes can be activated for specific
  * system situations using &wmarks.  If all schemes that registered to the
@@ -248,12 +260,7 @@ struct damos_stat {
  * &action is applied.
  */
 struct damos {
-	unsigned long min_sz_region;
-	unsigned long max_sz_region;
-	unsigned int min_nr_accesses;
-	unsigned int max_nr_accesses;
-	unsigned int min_age_region;
-	unsigned int max_age_region;
+	struct damos_access_pattern pattern;
 	enum damos_action action;
 	struct damos_quota quota;
 	struct damos_watermarks wmarks;
@@ -340,7 +347,7 @@ struct damon_operations {
 	unsigned long (*apply_scheme)(struct damon_ctx *context,
 			struct damon_target *t, struct damon_region *r,
 			struct damos *scheme);
-	bool (*target_valid)(void *target);
+	bool (*target_valid)(struct damon_target *t);
 	void (*cleanup)(struct damon_ctx *context);
 };
 
@@ -383,13 +390,15 @@ struct damon_callback {
 };
 
 /**
- * struct damon_ctx - Represents a context for each monitoring.  This is the
- * main interface that allows users to set the attributes and get the results
- * of the monitoring.
+ * struct damon_attrs - Monitoring attributes for accuracy/overhead control.
  *
  * @sample_interval:		The time between access samplings.
  * @aggr_interval:		The time between monitor results aggregations.
  * @ops_update_interval:	The time between monitoring operations updates.
+ * @min_nr_regions:		The minimum number of adaptive monitoring
+ *				regions.
+ * @max_nr_regions:		The maximum number of adaptive monitoring
+ *				regions.
  *
  * For each @sample_interval, DAMON checks whether each region is accessed or
  * not.  It aggregates and keeps the access information (number of accesses to
@@ -399,7 +408,21 @@ struct damon_callback {
  * @ops_update_interval.  All time intervals are in micro-seconds.
  * Please refer to &struct damon_operations and &struct damon_callback for more
  * detail.
+ */
+struct damon_attrs {
+	unsigned long sample_interval;
+	unsigned long aggr_interval;
+	unsigned long ops_update_interval;
+	unsigned long min_nr_regions;
+	unsigned long max_nr_regions;
+};
+
+/**
+ * struct damon_ctx - Represents a context for each monitoring.  This is the
+ * main interface that allows users to set the attributes and get the results
+ * of the monitoring.
  *
+ * @attrs:		Monitoring attributes for accuracy/overhead control.
  * @kdamond:		Kernel thread who does the monitoring.
  * @kdamond_lock:	Mutex for the synchronizations with @kdamond.
  *
@@ -421,19 +444,17 @@ struct damon_callback {
  * @ops:	Set of monitoring operations for given use cases.
  * @callback:	Set of callbacks for monitoring events notifications.
  *
- * @min_nr_regions:	The minimum number of adaptive monitoring regions.
- * @max_nr_regions:	The maximum number of adaptive monitoring regions.
  * @adaptive_targets:	Head of monitoring targets (&damon_target) list.
  * @schemes:		Head of schemes (&damos) list.
  */
 struct damon_ctx {
-	unsigned long sample_interval;
-	unsigned long aggr_interval;
-	unsigned long ops_update_interval;
+	struct damon_attrs attrs;
 
 /* private: internal use only */
 	struct timespec64 last_aggregation;
 	struct timespec64 last_ops_update;
+	/* for waiting until the execution of the kdamond_fn is started */
+	struct completion kdamond_started;
 
 /* public: */
 	struct task_struct *kdamond;
@@ -442,8 +463,6 @@ struct damon_ctx {
 	struct damon_operations ops;
 	struct damon_callback callback;
 
-	unsigned long min_nr_regions;
-	unsigned long max_nr_regions;
 	struct list_head adaptive_targets;
 	struct list_head schemes;
 };
@@ -463,8 +482,22 @@ static inline struct damon_region *damon_last_region(struct damon_target *t)
 	return list_last_entry(&t->regions_list, struct damon_region, list);
 }
 
+static inline struct damon_region *damon_first_region(struct damon_target *t)
+{
+	return list_first_entry(&t->regions_list, struct damon_region, list);
+}
+
+static inline unsigned long damon_sz_region(struct damon_region *r)
+{
+	return r->ar.end - r->ar.start;
+}
+
+
 #define damon_for_each_region(r, t) \
 	list_for_each_entry(r, &t->regions_list, list)
+
+#define damon_for_each_region_from(r, t) \
+	list_for_each_entry_from(r, &t->regions_list, list)
 
 #define damon_for_each_region_safe(r, next, t) \
 	list_for_each_entry_safe(r, next, &t->regions_list, list)
@@ -501,12 +534,9 @@ void damon_destroy_region(struct damon_region *r, struct damon_target *t);
 int damon_set_regions(struct damon_target *t, struct damon_addr_range *ranges,
 		unsigned int nr_ranges);
 
-struct damos *damon_new_scheme(
-		unsigned long min_sz_region, unsigned long max_sz_region,
-		unsigned int min_nr_accesses, unsigned int max_nr_accesses,
-		unsigned int min_age_region, unsigned int max_age_region,
-		enum damos_action action, struct damos_quota *quota,
-		struct damos_watermarks *wmarks);
+struct damos *damon_new_scheme(struct damos_access_pattern *pattern,
+			enum damos_action action, struct damos_quota *quota,
+			struct damos_watermarks *wmarks);
 void damon_add_scheme(struct damon_ctx *ctx, struct damos *s);
 void damon_destroy_scheme(struct damos *s);
 
@@ -519,10 +549,8 @@ unsigned int damon_nr_regions(struct damon_target *t);
 
 struct damon_ctx *damon_new_ctx(void);
 void damon_destroy_ctx(struct damon_ctx *ctx);
-int damon_set_attrs(struct damon_ctx *ctx, unsigned long sample_int,
-		unsigned long aggr_int, unsigned long ops_upd_int,
-		unsigned long min_nr_reg, unsigned long max_nr_reg);
-int damon_set_schemes(struct damon_ctx *ctx,
+int damon_set_attrs(struct damon_ctx *ctx, struct damon_attrs *attrs);
+void damon_set_schemes(struct damon_ctx *ctx,
 			struct damos **schemes, ssize_t nr_schemes);
 int damon_nr_running_ctxs(void);
 bool damon_is_registered_ops(enum damon_ops_id id);
@@ -534,9 +562,19 @@ static inline bool damon_target_has_pid(const struct damon_ctx *ctx)
 	return ctx->ops.id == DAMON_OPS_VADDR || ctx->ops.id == DAMON_OPS_FVADDR;
 }
 
+static inline unsigned int damon_max_nr_accesses(const struct damon_attrs *attrs)
+{
+	/* {aggr,sample}_interval are unsigned long, hence could overflow */
+	return min(attrs->aggr_interval / attrs->sample_interval,
+			(unsigned long)UINT_MAX);
+}
+
 
 int damon_start(struct damon_ctx **ctxs, int nr_ctxs, bool exclusive);
 int damon_stop(struct damon_ctx **ctxs, int nr_ctxs);
+
+int damon_set_region_biggest_system_ram_default(struct damon_target *t,
+				unsigned long *start, unsigned long *end);
 
 #endif	/* CONFIG_DAMON */
 

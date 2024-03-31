@@ -485,9 +485,16 @@ enum ice_pf_flags {
 	ICE_FLAG_VF_VLAN_PRUNING,
 	ICE_FLAG_LINK_LENIENT_MODE_ENA,
 	ICE_FLAG_PLUG_AUX_DEV,
+	ICE_FLAG_UNPLUG_AUX_DEV,
 	ICE_FLAG_MTU_CHANGED,
 	ICE_FLAG_GNSS,			/* GNSS successfully initialized */
 	ICE_PF_FLAGS_NBITS		/* must be last */
+};
+
+enum ice_misc_thread_tasks {
+	ICE_MISC_THREAD_EXTTS_EVENT,
+	ICE_MISC_THREAD_TX_TSTAMP,
+	ICE_MISC_THREAD_NBITS		/* must be last */
 };
 
 struct ice_switchdev_info {
@@ -531,6 +538,7 @@ struct ice_pf {
 	DECLARE_BITMAP(features, ICE_F_MAX);
 	DECLARE_BITMAP(state, ICE_STATE_NBITS);
 	DECLARE_BITMAP(flags, ICE_PF_FLAGS_NBITS);
+	DECLARE_BITMAP(misc_thread, ICE_MISC_THREAD_NBITS);
 	unsigned long *avail_txqs;	/* bitmap to track PF Tx queue usage */
 	unsigned long *avail_rxqs;	/* bitmap to track PF Rx queue usage */
 	unsigned long serv_tmr_period;
@@ -684,8 +692,8 @@ static inline void ice_set_ring_xdp(struct ice_tx_ring *ring)
  * ice_xsk_pool - get XSK buffer pool bound to a ring
  * @ring: Rx ring to use
  *
- * Returns a pointer to xdp_umem structure if there is a buffer pool present,
- * NULL otherwise.
+ * Returns a pointer to xsk_buff_pool structure if there is a buffer pool
+ * present, NULL otherwise.
  */
 static inline struct xsk_buff_pool *ice_xsk_pool(struct ice_rx_ring *ring)
 {
@@ -699,23 +707,33 @@ static inline struct xsk_buff_pool *ice_xsk_pool(struct ice_rx_ring *ring)
 }
 
 /**
- * ice_tx_xsk_pool - get XSK buffer pool bound to a ring
- * @ring: Tx ring to use
+ * ice_tx_xsk_pool - assign XSK buff pool to XDP ring
+ * @vsi: pointer to VSI
+ * @qid: index of a queue to look at XSK buff pool presence
  *
- * Returns a pointer to xdp_umem structure if there is a buffer pool present,
- * NULL otherwise. Tx equivalent of ice_xsk_pool.
+ * Sets XSK buff pool pointer on XDP ring.
+ *
+ * XDP ring is picked from Rx ring, whereas Rx ring is picked based on provided
+ * queue id. Reason for doing so is that queue vectors might have assigned more
+ * than one XDP ring, e.g. when user reduced the queue count on netdev; Rx ring
+ * carries a pointer to one of these XDP rings for its own purposes, such as
+ * handling XDP_TX action, therefore we can piggyback here on the
+ * rx_ring->xdp_ring assignment that was done during XDP rings initialization.
  */
-static inline struct xsk_buff_pool *ice_tx_xsk_pool(struct ice_tx_ring *ring)
+static inline void ice_tx_xsk_pool(struct ice_vsi *vsi, u16 qid)
 {
-	struct ice_vsi *vsi = ring->vsi;
-	u16 qid;
+	struct ice_tx_ring *ring;
 
-	qid = ring->q_index - vsi->alloc_txq;
+	ring = vsi->rx_rings[qid]->xdp_ring;
+	if (!ring)
+		return;
 
-	if (!ice_is_xdp_ena_vsi(vsi) || !test_bit(qid, vsi->af_xdp_zc_qps))
-		return NULL;
+	if (!ice_is_xdp_ena_vsi(vsi) || !test_bit(qid, vsi->af_xdp_zc_qps)) {
+		ring->xsk_pool = NULL;
+		return;
+	}
 
-	return xsk_get_pool_from_qid(vsi->netdev, qid);
+	ring->xsk_pool = xsk_get_pool_from_qid(vsi->netdev, qid);
 }
 
 /**
@@ -846,7 +864,7 @@ void ice_set_ethtool_repr_ops(struct net_device *netdev);
 void ice_set_ethtool_safe_mode_ops(struct net_device *netdev);
 u16 ice_get_avail_txq_count(struct ice_pf *pf);
 u16 ice_get_avail_rxq_count(struct ice_pf *pf);
-int ice_vsi_recfg_qs(struct ice_vsi *vsi, int new_rx, int new_tx);
+int ice_vsi_recfg_qs(struct ice_vsi *vsi, int new_rx, int new_tx, bool locked);
 void ice_update_vsi_stats(struct ice_vsi *vsi);
 void ice_update_pf_stats(struct ice_pf *pf);
 void
@@ -854,6 +872,7 @@ ice_fetch_u64_stats_per_ring(struct u64_stats_sync *syncp,
 			     struct ice_q_stats stats, u64 *pkts, u64 *bytes);
 int ice_up(struct ice_vsi *vsi);
 int ice_down(struct ice_vsi *vsi);
+int ice_down_up(struct ice_vsi *vsi);
 int ice_vsi_cfg(struct ice_vsi *vsi);
 struct ice_vsi *ice_lb_vsi_setup(struct ice_pf *pf, struct ice_port_info *pi);
 int ice_vsi_determine_xdp_res(struct ice_vsi *vsi);
@@ -915,16 +934,11 @@ static inline void ice_set_rdma_cap(struct ice_pf *pf)
  */
 static inline void ice_clear_rdma_cap(struct ice_pf *pf)
 {
-	/* We can directly unplug aux device here only if the flag bit
-	 * ICE_FLAG_PLUG_AUX_DEV is not set because ice_unplug_aux_dev()
-	 * could race with ice_plug_aux_dev() called from
-	 * ice_service_task(). In this case we only clear that bit now and
-	 * aux device will be unplugged later once ice_plug_aux_device()
-	 * called from ice_service_task() finishes (see ice_service_task()).
+	/* defer unplug to service task to avoid RTNL lock and
+	 * clear PLUG bit so that pending plugs don't interfere
 	 */
-	if (!test_and_clear_bit(ICE_FLAG_PLUG_AUX_DEV, pf->flags))
-		ice_unplug_aux_dev(pf);
-
+	clear_bit(ICE_FLAG_PLUG_AUX_DEV, pf->flags);
+	set_bit(ICE_FLAG_UNPLUG_AUX_DEV, pf->flags);
 	clear_bit(ICE_FLAG_RDMA_ENA, pf->flags);
 }
 #endif /* _ICE_H_ */

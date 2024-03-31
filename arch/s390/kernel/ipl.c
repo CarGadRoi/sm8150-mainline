@@ -29,6 +29,7 @@
 #include <asm/sclp.h>
 #include <asm/checksum.h>
 #include <asm/debug.h>
+#include <asm/abs_lowcore.h>
 #include <asm/os_info.h>
 #include <asm/sections.h>
 #include <asm/boot_data.h>
@@ -502,6 +503,8 @@ static struct attribute_group ipl_ccw_attr_group_lpar = {
 
 static struct attribute *ipl_unknown_attrs[] = {
 	&sys_ipl_type_attr.attr,
+	&sys_ipl_secure_attr.attr,
+	&sys_ipl_has_secure_attr.attr,
 	NULL,
 };
 
@@ -1642,12 +1645,16 @@ static struct shutdown_action __refdata dump_action = {
 static void dump_reipl_run(struct shutdown_trigger *trigger)
 {
 	unsigned long ipib = (unsigned long) reipl_block_actual;
+	struct lowcore *abs_lc;
+	unsigned long flags;
 	unsigned int csum;
 
 	csum = (__force unsigned int)
 	       csum_partial(reipl_block_actual, reipl_block_actual->hdr.len, 0);
-	put_abs_lowcore(ipib, ipib);
-	put_abs_lowcore(ipib_checksum, csum);
+	abs_lc = get_abs_lowcore(&flags);
+	abs_lc->ipib = ipib;
+	abs_lc->ipib_checksum = csum;
+	put_abs_lowcore(abs_lc, flags);
 	dump_run(trigger);
 }
 

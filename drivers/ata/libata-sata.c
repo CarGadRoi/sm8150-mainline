@@ -394,10 +394,23 @@ int sata_link_scr_lpm(struct ata_link *link, enum ata_lpm_policy policy,
 	case ATA_LPM_MED_POWER_WITH_DIPM:
 	case ATA_LPM_MIN_POWER_WITH_PARTIAL:
 	case ATA_LPM_MIN_POWER:
-		if (ata_link_nr_enabled(link) > 0)
-			/* no restrictions on LPM transitions */
+		if (ata_link_nr_enabled(link) > 0) {
+			/* assume no restrictions on LPM transitions */
 			scontrol &= ~(0x7 << 8);
-		else {
+
+			/*
+			 * If the controller does not support partial, slumber,
+			 * or devsleep, then disallow these transitions.
+			 */
+			if (link->ap->host->flags & ATA_HOST_NO_PART)
+				scontrol |= (0x1 << 8);
+
+			if (link->ap->host->flags & ATA_HOST_NO_SSC)
+				scontrol |= (0x2 << 8);
+
+			if (link->ap->host->flags & ATA_HOST_NO_DEVSLP)
+				scontrol |= (0x4 << 8);
+		} else {
 			/* empty port, power off */
 			scontrol &= ~0xf;
 			scontrol |= (0x1 << 2);
@@ -870,7 +883,7 @@ static ssize_t ata_ncq_prio_enable_show(struct device *device,
 	if (!dev)
 		rc = -ENODEV;
 	else
-		ncq_prio_enable = dev->flags & ATA_DFLAG_NCQ_PRIO_ENABLE;
+		ncq_prio_enable = dev->flags & ATA_DFLAG_NCQ_PRIO_ENABLED;
 	spin_unlock_irq(ap->lock);
 
 	return rc ? rc : sysfs_emit(buf, "%u\n", ncq_prio_enable);
@@ -905,9 +918,9 @@ static ssize_t ata_ncq_prio_enable_store(struct device *device,
 	}
 
 	if (input)
-		dev->flags |= ATA_DFLAG_NCQ_PRIO_ENABLE;
+		dev->flags |= ATA_DFLAG_NCQ_PRIO_ENABLED;
 	else
-		dev->flags &= ~ATA_DFLAG_NCQ_PRIO_ENABLE;
+		dev->flags &= ~ATA_DFLAG_NCQ_PRIO_ENABLED;
 
 unlock:
 	spin_unlock_irq(ap->lock);
@@ -1018,26 +1031,25 @@ DEVICE_ATTR(sw_activity, S_IWUSR | S_IRUGO, ata_scsi_activity_show,
 EXPORT_SYMBOL_GPL(dev_attr_sw_activity);
 
 /**
- *	__ata_change_queue_depth - helper for ata_scsi_change_queue_depth
- *	@ap: ATA port to which the device change the queue depth
+ *	ata_change_queue_depth - Set a device maximum queue depth
+ *	@ap: ATA port of the target device
+ *	@dev: target ATA device
  *	@sdev: SCSI device to configure queue depth for
  *	@queue_depth: new queue depth
  *
- *	libsas and libata have different approaches for associating a sdev to
- *	its ata_port.
+ *	Helper to set a device maximum queue depth, usable with both libsas
+ *	and libata.
  *
  */
-int __ata_change_queue_depth(struct ata_port *ap, struct scsi_device *sdev,
-			     int queue_depth)
+int ata_change_queue_depth(struct ata_port *ap, struct ata_device *dev,
+			   struct scsi_device *sdev, int queue_depth)
 {
-	struct ata_device *dev;
 	unsigned long flags;
 
-	if (queue_depth < 1 || queue_depth == sdev->queue_depth)
+	if (!dev || !ata_dev_enabled(dev))
 		return sdev->queue_depth;
 
-	dev = ata_scsi_find_dev(ap, sdev);
-	if (!dev || !ata_dev_enabled(dev))
+	if (queue_depth < 1 || queue_depth == sdev->queue_depth)
 		return sdev->queue_depth;
 
 	/* NCQ enabled? */
@@ -1059,7 +1071,7 @@ int __ata_change_queue_depth(struct ata_port *ap, struct scsi_device *sdev,
 
 	return scsi_change_queue_depth(sdev, queue_depth);
 }
-EXPORT_SYMBOL_GPL(__ata_change_queue_depth);
+EXPORT_SYMBOL_GPL(ata_change_queue_depth);
 
 /**
  *	ata_scsi_change_queue_depth - SCSI callback for queue depth config
@@ -1080,7 +1092,8 @@ int ata_scsi_change_queue_depth(struct scsi_device *sdev, int queue_depth)
 {
 	struct ata_port *ap = ata_shost_to_port(sdev->host);
 
-	return __ata_change_queue_depth(ap, sdev, queue_depth);
+	return ata_change_queue_depth(ap, ata_scsi_find_dev(ap, sdev),
+				      sdev, queue_depth);
 }
 EXPORT_SYMBOL_GPL(ata_scsi_change_queue_depth);
 
@@ -1392,7 +1405,8 @@ static int ata_eh_read_log_10h(struct ata_device *dev,
 	tf->hob_lbah = buf[10];
 	tf->nsect = buf[12];
 	tf->hob_nsect = buf[13];
-	if (dev->class == ATA_DEV_ZAC && ata_id_has_ncq_autosense(dev->id))
+	if (dev->class == ATA_DEV_ZAC && ata_id_has_ncq_autosense(dev->id) &&
+	    (tf->status & ATA_SENSE))
 		tf->auxiliary = buf[14] << 16 | buf[15] << 8 | buf[16];
 
 	return 0;
@@ -1456,8 +1470,12 @@ void ata_eh_analyze_ncq_error(struct ata_link *link)
 	memcpy(&qc->result_tf, &tf, sizeof(tf));
 	qc->result_tf.flags = ATA_TFLAG_ISADDR | ATA_TFLAG_LBA | ATA_TFLAG_LBA48;
 	qc->err_mask |= AC_ERR_DEV | AC_ERR_NCQ;
-	if (dev->class == ATA_DEV_ZAC &&
-	    ((qc->result_tf.status & ATA_SENSE) || qc->result_tf.auxiliary)) {
+
+	/*
+	 * If the device supports NCQ autosense, ata_eh_read_log_10h() will have
+	 * stored the sense data in qc->result_tf.auxiliary.
+	 */
+	if (qc->result_tf.auxiliary) {
 		char sense_key, asc, ascq;
 
 		sense_key = (qc->result_tf.auxiliary >> 16) & 0xff;

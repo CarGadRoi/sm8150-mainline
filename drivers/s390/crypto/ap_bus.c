@@ -233,8 +233,11 @@ static void __init ap_init_qci_info(void)
 	if (!ap_qci_info)
 		return;
 	ap_qci_info_old = kzalloc(sizeof(*ap_qci_info_old), GFP_KERNEL);
-	if (!ap_qci_info_old)
+	if (!ap_qci_info_old) {
+		kfree(ap_qci_info);
+		ap_qci_info = NULL;
 		return;
+	}
 	if (ap_fetch_qci_info(ap_qci_info) != 0) {
 		kfree(ap_qci_info);
 		kfree(ap_qci_info_old);
@@ -1009,6 +1012,10 @@ EXPORT_SYMBOL(ap_driver_unregister);
 
 void ap_bus_force_rescan(void)
 {
+	/* Only trigger AP bus scans after the initial scan is done */
+	if (atomic64_read(&ap_scan_bus_count) <= 0)
+		return;
+
 	/* processing a asynchronous bus rescan */
 	del_timer(&ap_config_timer);
 	queue_work(system_long_wq, &ap_scan_work);
@@ -2086,6 +2093,9 @@ static inline void ap_scan_adapter(int ap)
  */
 static bool ap_get_configuration(void)
 {
+	if (!ap_qci_info)	/* QCI not supported */
+		return false;
+
 	memcpy(ap_qci_info_old, ap_qci_info, sizeof(*ap_qci_info));
 	ap_fetch_qci_info(ap_qci_info);
 

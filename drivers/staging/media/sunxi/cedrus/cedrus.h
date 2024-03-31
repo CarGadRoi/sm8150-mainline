@@ -109,6 +109,11 @@ struct cedrus_buffer {
 			unsigned int			position;
 			enum cedrus_h264_pic_type	pic_type;
 		} h264;
+		struct {
+			void		*mv_col_buf;
+			dma_addr_t	mv_col_buf_dma;
+			ssize_t		mv_col_buf_size;
+		} h265;
 	} codec;
 };
 
@@ -142,10 +147,6 @@ struct cedrus_ctx {
 			ssize_t		intra_pred_buf_size;
 		} h264;
 		struct {
-			void		*mv_col_buf;
-			dma_addr_t	mv_col_buf_addr;
-			ssize_t		mv_col_buf_size;
-			ssize_t		mv_col_buf_unit_size;
 			void		*neighbor_info_buf;
 			dma_addr_t	neighbor_info_buf_addr;
 			void		*entry_points_buf;
@@ -237,19 +238,23 @@ static inline dma_addr_t cedrus_buf_addr(struct vb2_buffer *buf,
 }
 
 static inline dma_addr_t cedrus_dst_buf_addr(struct cedrus_ctx *ctx,
-					     int index, unsigned int plane)
+					     struct vb2_buffer *buf,
+					     unsigned int plane)
 {
-	struct vb2_buffer *buf = NULL;
-	struct vb2_queue *vq;
-
-	if (index < 0)
-		return 0;
-
-	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE);
-	if (vq)
-		buf = vb2_get_buffer(vq, index);
-
 	return buf ? cedrus_buf_addr(buf, &ctx->dst_fmt, plane) : 0;
+}
+
+static inline void cedrus_write_ref_buf_addr(struct cedrus_ctx *ctx,
+					     struct vb2_queue *q,
+					     u64 timestamp,
+					     u32 luma_reg,
+					     u32 chroma_reg)
+{
+	struct cedrus_dev *dev = ctx->dev;
+	struct vb2_buffer *buf = vb2_find_buffer(q, timestamp);
+
+	cedrus_write(dev, luma_reg, cedrus_dst_buf_addr(ctx, buf, 0));
+	cedrus_write(dev, chroma_reg, cedrus_dst_buf_addr(ctx, buf, 1));
 }
 
 static inline struct cedrus_buffer *

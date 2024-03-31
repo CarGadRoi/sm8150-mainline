@@ -312,7 +312,8 @@ static inline void blk_mq_clear_mq_map(struct blk_mq_queue_map *qmap)
 static inline struct blk_plug *blk_mq_plug( struct bio *bio)
 {
 	/* Zoned block device write operation case: do not plug the BIO */
-	if (bdev_is_zoned(bio->bi_bdev) && op_is_write(bio_op(bio)))
+	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED) &&
+	    bdev_op_is_zoned_write(bio->bi_bdev, bio_op(bio)))
 		return NULL;
 
 	/*
@@ -361,8 +362,7 @@ static inline bool hctx_may_queue(struct blk_mq_hw_ctx *hctx,
 			return true;
 	}
 
-	users = atomic_read(&hctx->tags->active_queues);
-
+	users = READ_ONCE(hctx->tags->active_queues);
 	if (!users)
 		return true;
 

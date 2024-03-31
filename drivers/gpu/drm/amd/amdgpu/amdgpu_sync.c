@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /*
  * Copyright 2014 Advanced Micro Devices, Inc.
  * All Rights Reserved.
@@ -190,7 +191,8 @@ static bool amdgpu_sync_test_fence(struct amdgpu_device *adev,
 
 	/* Never sync to VM updates either. */
 	if (fence_owner == AMDGPU_FENCE_OWNER_VM &&
-	    owner != AMDGPU_FENCE_OWNER_UNDEFINED)
+	    owner != AMDGPU_FENCE_OWNER_UNDEFINED &&
+	    owner != AMDGPU_FENCE_OWNER_KFD)
 		return false;
 
 	/* Ignore fences depending on the sync mode */
@@ -315,6 +317,7 @@ struct dma_fence *amdgpu_sync_get_fence(struct amdgpu_sync *sync)
 	struct hlist_node *tmp;
 	struct dma_fence *f;
 	int i;
+
 	hash_for_each_safe(sync->fences, i, tmp, e, node) {
 
 		f = e->fence;
@@ -392,7 +395,7 @@ void amdgpu_sync_free(struct amdgpu_sync *sync)
 {
 	struct amdgpu_sync_entry *e;
 	struct hlist_node *tmp;
-	unsigned i;
+	unsigned int i;
 
 	hash_for_each_safe(sync->fences, i, tmp, e, node) {
 		hash_del(&e->node);

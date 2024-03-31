@@ -1505,7 +1505,7 @@ static void mvneta_defaults_set(struct mvneta_port *pp)
 			 */
 			if (txq_number == 1)
 				txq_map = (cpu == pp->rxq_def) ?
-					MVNETA_CPU_TXQ_ACCESS(1) : 0;
+					MVNETA_CPU_TXQ_ACCESS(0) : 0;
 
 		} else {
 			txq_map = MVNETA_CPU_TXQ_ACCESS_ALL_MASK;
@@ -4271,7 +4271,7 @@ static void mvneta_percpu_elect(struct mvneta_port *pp)
 	/* Use the cpu associated to the rxq when it is online, in all
 	 * the other cases, use the cpu 0 which can't be offline.
 	 */
-	if (cpu_online(pp->rxq_def))
+	if (pp->rxq_def < nr_cpu_ids && cpu_online(pp->rxq_def))
 		elected_cpu = pp->rxq_def;
 
 	max_cpu = num_present_cpus();
@@ -4294,7 +4294,7 @@ static void mvneta_percpu_elect(struct mvneta_port *pp)
 		 */
 		if (txq_number == 1)
 			txq_map = (cpu == elected_cpu) ?
-				MVNETA_CPU_TXQ_ACCESS(1) : 0;
+				MVNETA_CPU_TXQ_ACCESS(0) : 0;
 		else
 			txq_map = mvreg_read(pp, MVNETA_CPU_MAP(cpu)) &
 				MVNETA_CPU_TXQ_ACCESS_ALL_MASK;
@@ -4656,11 +4656,11 @@ mvneta_ethtool_get_coalesce(struct net_device *dev,
 static void mvneta_ethtool_get_drvinfo(struct net_device *dev,
 				    struct ethtool_drvinfo *drvinfo)
 {
-	strlcpy(drvinfo->driver, MVNETA_DRIVER_NAME,
+	strscpy(drvinfo->driver, MVNETA_DRIVER_NAME,
 		sizeof(drvinfo->driver));
-	strlcpy(drvinfo->version, MVNETA_DRIVER_VERSION,
+	strscpy(drvinfo->version, MVNETA_DRIVER_VERSION,
 		sizeof(drvinfo->version));
-	strlcpy(drvinfo->bus_info, dev_name(&dev->dev),
+	strscpy(drvinfo->bus_info, dev_name(&dev->dev),
 		sizeof(drvinfo->bus_info));
 }
 
@@ -4730,14 +4730,17 @@ static void mvneta_ethtool_get_strings(struct net_device *netdev, u32 sset,
 				       u8 *data)
 {
 	if (sset == ETH_SS_STATS) {
+		struct mvneta_port *pp = netdev_priv(netdev);
 		int i;
 
 		for (i = 0; i < ARRAY_SIZE(mvneta_statistics); i++)
 			memcpy(data + i * ETH_GSTRING_LEN,
 			       mvneta_statistics[i].name, ETH_GSTRING_LEN);
 
-		data += ETH_GSTRING_LEN * ARRAY_SIZE(mvneta_statistics);
-		page_pool_ethtool_stats_get_strings(data);
+		if (!pp->bm_priv) {
+			data += ETH_GSTRING_LEN * ARRAY_SIZE(mvneta_statistics);
+			page_pool_ethtool_stats_get_strings(data);
+		}
 	}
 }
 
@@ -4855,8 +4858,10 @@ static void mvneta_ethtool_pp_stats(struct mvneta_port *pp, u64 *data)
 	struct page_pool_stats stats = {};
 	int i;
 
-	for (i = 0; i < rxq_number; i++)
-		page_pool_get_stats(pp->rxqs[i].page_pool, &stats);
+	for (i = 0; i < rxq_number; i++) {
+		if (pp->rxqs[i].page_pool)
+			page_pool_get_stats(pp->rxqs[i].page_pool, &stats);
+	}
 
 	page_pool_ethtool_stats_get(data, &stats);
 }
@@ -4872,14 +4877,21 @@ static void mvneta_ethtool_get_stats(struct net_device *dev,
 	for (i = 0; i < ARRAY_SIZE(mvneta_statistics); i++)
 		*data++ = pp->ethtool_stats[i];
 
-	mvneta_ethtool_pp_stats(pp, data);
+	if (!pp->bm_priv)
+		mvneta_ethtool_pp_stats(pp, data);
 }
 
 static int mvneta_ethtool_get_sset_count(struct net_device *dev, int sset)
 {
-	if (sset == ETH_SS_STATS)
-		return ARRAY_SIZE(mvneta_statistics) +
-		       page_pool_ethtool_stats_get_count();
+	if (sset == ETH_SS_STATS) {
+		int count = ARRAY_SIZE(mvneta_statistics);
+		struct mvneta_port *pp = netdev_priv(dev);
+
+		if (!pp->bm_priv)
+			count += page_pool_ethtool_stats_get_count();
+
+		return count;
+	}
 
 	return -EOPNOTSUPP;
 }
@@ -5600,14 +5612,13 @@ static int mvneta_probe(struct platform_device *pdev)
 	 * operation, so only single NAPI should be initialized.
 	 */
 	if (pp->neta_armada3700) {
-		netif_napi_add(dev, &pp->napi, mvneta_poll, NAPI_POLL_WEIGHT);
+		netif_napi_add(dev, &pp->napi, mvneta_poll);
 	} else {
 		for_each_present_cpu(cpu) {
 			struct mvneta_pcpu_port *port =
 				per_cpu_ptr(pp->ports, cpu);
 
-			netif_napi_add(dev, &port->napi, mvneta_poll,
-				       NAPI_POLL_WEIGHT);
+			netif_napi_add(dev, &port->napi, mvneta_poll);
 			port->pp = pp;
 		}
 	}

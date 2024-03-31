@@ -562,6 +562,9 @@ ieee80211_get_sband_iftype_data(const struct ieee80211_supported_band *sband,
 	if (WARN_ON(iftype >= NL80211_IFTYPE_MAX))
 		return NULL;
 
+	if (iftype == NL80211_IFTYPE_AP_VLAN)
+		iftype = NL80211_IFTYPE_AP;
+
 	for (i = 0; i < sband->n_iftype_data; i++)  {
 		const struct ieee80211_sband_iftype_data *data =
 			&sband->iftype_data[i];
@@ -2316,6 +2319,7 @@ struct ocb_setup {
  * @cwmax: Maximum contention window [a value of the form 2^n-1 in the range
  *	1..32767]
  * @aifs: Arbitration interframe space [0..255]
+ * @link_id: link_id or -1 for non-MLD
  */
 struct ieee80211_txq_params {
 	enum nl80211_ac ac;
@@ -2323,6 +2327,7 @@ struct ieee80211_txq_params {
 	u16 cwmin;
 	u16 cwmax;
 	u8 aifs;
+	int link_id;
 };
 
 /**
@@ -3929,22 +3934,33 @@ struct mgmt_frame_regs {
  * @del_intf_link: Remove an MLO link from the given interface.
  *
  * @add_key: add a key with the given parameters. @mac_addr will be %NULL
- *	when adding a group key.
+ *	when adding a group key. @link_id will be -1 for non-MLO connection.
+ *	For MLO connection, @link_id will be >= 0 for group key and -1 for
+ *	pairwise key, @mac_addr will be peer's MLD address for MLO pairwise key.
  *
  * @get_key: get information about the key with the given parameters.
  *	@mac_addr will be %NULL when requesting information for a group
  *	key. All pointers given to the @callback function need not be valid
  *	after it returns. This function should return an error if it is
  *	not possible to retrieve the key, -ENOENT if it doesn't exist.
+ *	@link_id will be -1 for non-MLO connection. For MLO connection,
+ *	@link_id will be >= 0 for group key and -1 for pairwise key, @mac_addr
+ *	will be peer's MLD address for MLO pairwise key.
  *
  * @del_key: remove a key given the @mac_addr (%NULL for a group key)
- *	and @key_index, return -ENOENT if the key doesn't exist.
+ *	and @key_index, return -ENOENT if the key doesn't exist. @link_id will
+ *	be -1 for non-MLO connection. For MLO connection, @link_id will be >= 0
+ *	for group key and -1 for pairwise key, @mac_addr will be peer's MLD
+ *	address for MLO pairwise key.
  *
- * @set_default_key: set the default key on an interface
+ * @set_default_key: set the default key on an interface. @link_id will be >= 0
+ *	for MLO connection and -1 for non-MLO connection.
  *
- * @set_default_mgmt_key: set the default management frame key on an interface
+ * @set_default_mgmt_key: set the default management frame key on an interface.
+ *	@link_id will be >= 0 for MLO connection and -1 for non-MLO connection.
  *
- * @set_default_beacon_key: set the default Beacon frame key on an interface
+ * @set_default_beacon_key: set the default Beacon frame key on an interface.
+ *	@link_id will be >= 0 for MLO connection and -1 for non-MLO connection.
  *
  * @set_rekey_data: give the data necessary for GTK rekeying to the driver
  *
@@ -4293,22 +4309,24 @@ struct cfg80211_ops {
 				 unsigned int link_id);
 
 	int	(*add_key)(struct wiphy *wiphy, struct net_device *netdev,
-			   u8 key_index, bool pairwise, const u8 *mac_addr,
-			   struct key_params *params);
+			   int link_id, u8 key_index, bool pairwise,
+			   const u8 *mac_addr, struct key_params *params);
 	int	(*get_key)(struct wiphy *wiphy, struct net_device *netdev,
-			   u8 key_index, bool pairwise, const u8 *mac_addr,
-			   void *cookie,
+			   int link_id, u8 key_index, bool pairwise,
+			   const u8 *mac_addr, void *cookie,
 			   void (*callback)(void *cookie, struct key_params*));
 	int	(*del_key)(struct wiphy *wiphy, struct net_device *netdev,
-			   u8 key_index, bool pairwise, const u8 *mac_addr);
+			   int link_id, u8 key_index, bool pairwise,
+			   const u8 *mac_addr);
 	int	(*set_default_key)(struct wiphy *wiphy,
-				   struct net_device *netdev,
+				   struct net_device *netdev, int link_id,
 				   u8 key_index, bool unicast, bool multicast);
 	int	(*set_default_mgmt_key)(struct wiphy *wiphy,
-					struct net_device *netdev,
+					struct net_device *netdev, int link_id,
 					u8 key_index);
 	int	(*set_default_beacon_key)(struct wiphy *wiphy,
 					  struct net_device *netdev,
+					  int link_id,
 					  u8 key_index);
 
 	int	(*start_ap)(struct wiphy *wiphy, struct net_device *dev,
@@ -5603,12 +5621,17 @@ struct cfg80211_cqm_config;
  * wiphy_lock - lock the wiphy
  * @wiphy: the wiphy to lock
  *
- * This is mostly exposed so it can be done around registering and
- * unregistering netdevs that aren't created through cfg80211 calls,
- * since that requires locking in cfg80211 when the notifiers is
- * called, but that cannot differentiate which way it's called.
+ * This is needed around registering and unregistering netdevs that
+ * aren't created through cfg80211 calls, since that requires locking
+ * in cfg80211 when the notifiers is called, but that cannot
+ * differentiate which way it's called.
+ *
+ * It can also be used by drivers for their own purposes.
  *
  * When cfg80211 ops are called, the wiphy is already locked.
+ *
+ * Note that this makes sure that no workers that have been queued
+ * with wiphy_queue_work() are running.
  */
 static inline void wiphy_lock(struct wiphy *wiphy)
 	__acquires(&wiphy->mtx)
@@ -5627,6 +5650,109 @@ static inline void wiphy_unlock(struct wiphy *wiphy)
 	__release(&wiphy->mtx);
 	mutex_unlock(&wiphy->mtx);
 }
+
+struct wiphy_work;
+typedef void (*wiphy_work_func_t)(struct wiphy *, struct wiphy_work *);
+
+struct wiphy_work {
+	struct list_head entry;
+	wiphy_work_func_t func;
+};
+
+static inline void wiphy_work_init(struct wiphy_work *work,
+				   wiphy_work_func_t func)
+{
+	INIT_LIST_HEAD(&work->entry);
+	work->func = func;
+}
+
+/**
+ * wiphy_work_queue - queue work for the wiphy
+ * @wiphy: the wiphy to queue for
+ * @work: the work item
+ *
+ * This is useful for work that must be done asynchronously, and work
+ * queued here has the special property that the wiphy mutex will be
+ * held as if wiphy_lock() was called, and that it cannot be running
+ * after wiphy_lock() was called. Therefore, wiphy_cancel_work() can
+ * use just cancel_work() instead of cancel_work_sync(), it requires
+ * being in a section protected by wiphy_lock().
+ */
+void wiphy_work_queue(struct wiphy *wiphy, struct wiphy_work *work);
+
+/**
+ * wiphy_work_cancel - cancel previously queued work
+ * @wiphy: the wiphy, for debug purposes
+ * @work: the work to cancel
+ *
+ * Cancel the work *without* waiting for it, this assumes being
+ * called under the wiphy mutex acquired by wiphy_lock().
+ */
+void wiphy_work_cancel(struct wiphy *wiphy, struct wiphy_work *work);
+
+/**
+ * wiphy_work_flush - flush previously queued work
+ * @wiphy: the wiphy, for debug purposes
+ * @work: the work to flush, this can be %NULL to flush all work
+ *
+ * Flush the work (i.e. run it if pending). This must be called
+ * under the wiphy mutex acquired by wiphy_lock().
+ */
+void wiphy_work_flush(struct wiphy *wiphy, struct wiphy_work *work);
+
+struct wiphy_delayed_work {
+	struct wiphy_work work;
+	struct wiphy *wiphy;
+	struct timer_list timer;
+};
+
+void wiphy_delayed_work_timer(struct timer_list *t);
+
+static inline void wiphy_delayed_work_init(struct wiphy_delayed_work *dwork,
+					   wiphy_work_func_t func)
+{
+	timer_setup(&dwork->timer, wiphy_delayed_work_timer, 0);
+	wiphy_work_init(&dwork->work, func);
+}
+
+/**
+ * wiphy_delayed_work_queue - queue delayed work for the wiphy
+ * @wiphy: the wiphy to queue for
+ * @dwork: the delayable worker
+ * @delay: number of jiffies to wait before queueing
+ *
+ * This is useful for work that must be done asynchronously, and work
+ * queued here has the special property that the wiphy mutex will be
+ * held as if wiphy_lock() was called, and that it cannot be running
+ * after wiphy_lock() was called. Therefore, wiphy_cancel_work() can
+ * use just cancel_work() instead of cancel_work_sync(), it requires
+ * being in a section protected by wiphy_lock().
+ */
+void wiphy_delayed_work_queue(struct wiphy *wiphy,
+			      struct wiphy_delayed_work *dwork,
+			      unsigned long delay);
+
+/**
+ * wiphy_delayed_work_cancel - cancel previously queued delayed work
+ * @wiphy: the wiphy, for debug purposes
+ * @dwork: the delayed work to cancel
+ *
+ * Cancel the work *without* waiting for it, this assumes being
+ * called under the wiphy mutex acquired by wiphy_lock().
+ */
+void wiphy_delayed_work_cancel(struct wiphy *wiphy,
+			       struct wiphy_delayed_work *dwork);
+
+/**
+ * wiphy_delayed_work_flush - flush previously queued delayed work
+ * @wiphy: the wiphy, for debug purposes
+ * @work: the work to flush
+ *
+ * Flush the work (i.e. run it if pending). This must be called
+ * under the wiphy mutex acquired by wiphy_lock().
+ */
+void wiphy_delayed_work_flush(struct wiphy *wiphy,
+			      struct wiphy_delayed_work *dwork);
 
 /**
  * struct wireless_dev - wireless device state
@@ -5700,6 +5826,7 @@ static inline void wiphy_unlock(struct wiphy *wiphy)
  * @event_lock: (private) lock for event list
  * @owner_nlportid: (private) owner socket port ID
  * @nl_owner_dead: (private) owner socket went away
+ * @cqm_rssi_work: (private) CQM RSSI reporting work
  * @cqm_config: (private) nl80211 RSSI monitor state
  * @pmsr_list: (private) peer measurement requests
  * @pmsr_lock: (private) peer measurements requests/results lock
@@ -5772,7 +5899,8 @@ struct wireless_dev {
 	} wext;
 #endif
 
-	struct cfg80211_cqm_config *cqm_config;
+	struct wiphy_work cqm_rssi_work;
+	struct cfg80211_cqm_config __rcu *cqm_config;
 
 	struct list_head pmsr_list;
 	spinlock_t pmsr_lock;
@@ -8266,6 +8394,7 @@ void cfg80211_ch_switch_notify(struct net_device *dev,
  * cfg80211_ch_switch_started_notify - notify channel switch start
  * @dev: the device on which the channel switch started
  * @chandef: the future channel definition
+ * @link_id: the link ID for MLO, must be 0 for non-MLO
  * @count: the number of TBTTs until the channel switch happens
  * @quiet: whether or not immediate quiet was requested by the AP
  *
@@ -8275,7 +8404,8 @@ void cfg80211_ch_switch_notify(struct net_device *dev,
  */
 void cfg80211_ch_switch_started_notify(struct net_device *dev,
 				       struct cfg80211_chan_def *chandef,
-				       u8 count, bool quiet);
+				       unsigned int link_id, u8 count,
+				       bool quiet);
 
 /**
  * ieee80211_operating_class_to_band - convert operating class to band

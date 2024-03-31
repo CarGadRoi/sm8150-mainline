@@ -16,6 +16,7 @@
 #include "rtrs-log.h"
 #include <rdma/ib_cm.h>
 #include <rdma/ib_verbs.h>
+#include "rtrs-srv-trace.h"
 
 MODULE_DESCRIPTION("RDMA Transport Server");
 MODULE_LICENSE("GPL");
@@ -57,18 +58,14 @@ static inline struct rtrs_srv_con *to_srv_con(struct rtrs_con *c)
 	return container_of(c, struct rtrs_srv_con, c);
 }
 
-static inline struct rtrs_srv_path *to_srv_path(struct rtrs_path *s)
-{
-	return container_of(s, struct rtrs_srv_path, s);
-}
-
 static bool rtrs_srv_change_state(struct rtrs_srv_path *srv_path,
 				  enum rtrs_srv_state new_state)
 {
 	enum rtrs_srv_state old_state;
 	bool changed = false;
+	unsigned long flags;
 
-	spin_lock_irq(&srv_path->state_lock);
+	spin_lock_irqsave(&srv_path->state_lock, flags);
 	old_state = srv_path->state;
 	switch (new_state) {
 	case RTRS_SRV_CONNECTED:
@@ -89,7 +86,7 @@ static bool rtrs_srv_change_state(struct rtrs_srv_path *srv_path,
 	}
 	if (changed)
 		srv_path->state = new_state;
-	spin_unlock_irq(&srv_path->state_lock);
+	spin_unlock_irqrestore(&srv_path->state_lock, flags);
 
 	return changed;
 }
@@ -375,6 +372,8 @@ static int send_io_resp_imm(struct rtrs_srv_con *con, struct rtrs_srv_op *id,
 		}
 	}
 
+	trace_send_io_resp_imm(id, need_inval, always_invalidate, errno);
+
 	if (need_inval && always_invalidate) {
 		wr = &inv_wr;
 		inv_wr.next = &rwr.wr;
@@ -550,7 +549,10 @@ static void unmap_cont_bufs(struct rtrs_srv_path *srv_path)
 		struct rtrs_srv_mr *srv_mr;
 
 		srv_mr = &srv_path->mrs[i];
-		rtrs_iu_free(srv_mr->iu, srv_path->s.dev->ib_dev, 1);
+
+		if (always_invalidate)
+			rtrs_iu_free(srv_mr->iu, srv_path->s.dev->ib_dev, 1);
+
 		ib_dereg_mr(srv_mr->mr);
 		ib_dma_unmap_sg(srv_path->s.dev->ib_dev, srv_mr->sgt.sgl,
 				srv_mr->sgt.nents, DMA_BIDIRECTIONAL);
@@ -595,7 +597,7 @@ static int map_cont_bufs(struct rtrs_srv_path *srv_path)
 		struct sg_table *sgt = &srv_mr->sgt;
 		struct scatterlist *s;
 		struct ib_mr *mr;
-		int nr, chunks;
+		int nr, nr_sgt, chunks;
 
 		chunks = chunks_per_mr * mri;
 		if (!always_invalidate)
@@ -610,19 +612,19 @@ static int map_cont_bufs(struct rtrs_srv_path *srv_path)
 			sg_set_page(s, srv->chunks[chunks + i],
 				    max_chunk_size, 0);
 
-		nr = ib_dma_map_sg(srv_path->s.dev->ib_dev, sgt->sgl,
+		nr_sgt = ib_dma_map_sg(srv_path->s.dev->ib_dev, sgt->sgl,
 				   sgt->nents, DMA_BIDIRECTIONAL);
-		if (nr < sgt->nents) {
-			err = nr < 0 ? nr : -EINVAL;
+		if (!nr_sgt) {
+			err = -EINVAL;
 			goto free_sg;
 		}
 		mr = ib_alloc_mr(srv_path->s.dev->ib_pd, IB_MR_TYPE_MEM_REG,
-				 sgt->nents);
+				 nr_sgt);
 		if (IS_ERR(mr)) {
 			err = PTR_ERR(mr);
 			goto unmap_sg;
 		}
-		nr = ib_map_mr_sg(mr, sgt->sgl, sgt->nents,
+		nr = ib_map_mr_sg(mr, sgt->sgl, nr_sgt,
 				  NULL, max_chunk_size);
 		if (nr < 0 || nr < sgt->nents) {
 			err = nr < 0 ? nr : -EINVAL;
@@ -641,7 +643,7 @@ static int map_cont_bufs(struct rtrs_srv_path *srv_path)
 			}
 		}
 		/* Eventually dma addr for each chunk can be cached */
-		for_each_sg(sgt->sgl, s, sgt->orig_nents, i)
+		for_each_sg(sgt->sgl, s, nr_sgt, i)
 			srv_path->dma_addr[chunks + i] = sg_dma_address(s);
 
 		ib_update_fast_reg_key(mr, ib_inc_rkey(mr->rkey));
@@ -716,20 +718,23 @@ static void rtrs_srv_info_rsp_done(struct ib_cq *cq, struct ib_wc *wc)
 	WARN_ON(wc->opcode != IB_WC_SEND);
 }
 
-static void rtrs_srv_path_up(struct rtrs_srv_path *srv_path)
+static int rtrs_srv_path_up(struct rtrs_srv_path *srv_path)
 {
 	struct rtrs_srv_sess *srv = srv_path->srv;
 	struct rtrs_srv_ctx *ctx = srv->ctx;
-	int up;
+	int up, ret = 0;
 
 	mutex_lock(&srv->paths_ev_mutex);
 	up = ++srv->paths_up;
 	if (up == 1)
-		ctx->ops.link_ev(srv, RTRS_SRV_LINK_EV_CONNECTED, NULL);
+		ret = ctx->ops.link_ev(srv, RTRS_SRV_LINK_EV_CONNECTED, NULL);
 	mutex_unlock(&srv->paths_ev_mutex);
 
 	/* Mark session as established */
-	srv_path->established = true;
+	if (!ret)
+		srv_path->established = true;
+
+	return ret;
 }
 
 static void rtrs_srv_path_down(struct rtrs_srv_path *srv_path)
@@ -858,7 +863,12 @@ static int process_info_req(struct rtrs_srv_con *con,
 		goto iu_free;
 	kobject_get(&srv_path->kobj);
 	get_device(&srv_path->srv->dev);
-	rtrs_srv_change_state(srv_path, RTRS_SRV_CONNECTED);
+	err = rtrs_srv_change_state(srv_path, RTRS_SRV_CONNECTED);
+	if (!err) {
+		rtrs_err(s, "rtrs_srv_change_state(), err: %d\n", err);
+		goto iu_free;
+	}
+
 	rtrs_srv_start_hb(srv_path);
 
 	/*
@@ -867,7 +877,11 @@ static int process_info_req(struct rtrs_srv_con *con,
 	 * all connections are successfully established.  Thus, simply notify
 	 * listener with a proper event if we are the first path.
 	 */
-	rtrs_srv_path_up(srv_path);
+	err = rtrs_srv_path_up(srv_path);
+	if (err) {
+		rtrs_err(s, "rtrs_srv_path_up(), err: %d\n", err);
+		goto iu_free;
+	}
 
 	ib_dma_sync_single_for_device(srv_path->s.dev->ib_dev,
 				      tx_iu->dma_addr,
@@ -1024,7 +1038,7 @@ static void process_read(struct rtrs_srv_con *con,
 	usr_len = le16_to_cpu(msg->usr_len);
 	data_len = off - usr_len;
 	data = page_address(srv->chunks[buf_id]);
-	ret = ctx->ops.rdma_ev(srv->priv, id, READ, data, data_len,
+	ret = ctx->ops.rdma_ev(srv->priv, id, data, data_len,
 			   data + data_len, usr_len);
 
 	if (ret) {
@@ -1077,7 +1091,7 @@ static void process_write(struct rtrs_srv_con *con,
 	usr_len = le16_to_cpu(req->usr_len);
 	data_len = off - usr_len;
 	data = page_address(srv->chunks[buf_id]);
-	ret = ctx->ops.rdma_ev(srv->priv, id, WRITE, data, data_len,
+	ret = ctx->ops.rdma_ev(srv->priv, id, data, data_len,
 			       data + data_len, usr_len);
 	if (ret) {
 		rtrs_err_rl(s,
@@ -1523,7 +1537,6 @@ static void rtrs_srv_close_work(struct work_struct *work)
 
 	srv_path = container_of(work, typeof(*srv_path), close_work);
 
-	rtrs_srv_destroy_path_files(srv_path);
 	rtrs_srv_stop_hb(srv_path);
 
 	for (i = 0; i < srv_path->s.con_num; i++) {
@@ -1542,6 +1555,8 @@ static void rtrs_srv_close_work(struct work_struct *work)
 
 	/* Wait for all completion */
 	wait_for_completion(&srv_path->complete_done);
+
+	rtrs_srv_destroy_path_files(srv_path);
 
 	/* Notify upper layer if we are the last path */
 	rtrs_srv_path_down(srv_path);

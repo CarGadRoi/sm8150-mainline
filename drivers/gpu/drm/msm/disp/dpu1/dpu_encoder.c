@@ -2,7 +2,7 @@
 /*
  * Copyright (C) 2013 Red Hat
  * Copyright (c) 2014-2018, 2020-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Author: Rob Clark <robdclark@gmail.com>
  */
@@ -36,6 +36,9 @@
 		(e) ? (e)->base.base.id : -1, ##__VA_ARGS__)
 
 #define DPU_ERROR_ENC(e, fmt, ...) DPU_ERROR("enc%d " fmt,\
+		(e) ? (e)->base.base.id : -1, ##__VA_ARGS__)
+
+#define DPU_ERROR_ENC_RATELIMITED(e, fmt, ...) DPU_ERROR_RATELIMITED("enc%d " fmt,\
 		(e) ? (e)->base.base.id : -1, ##__VA_ARGS__)
 
 /*
@@ -162,7 +165,7 @@ enum dpu_enc_rc_states {
  * @vsync_event_work:		worker to handle vsync event for autorefresh
  * @topology:                   topology of the display
  * @idle_timeout:		idle timeout duration in milliseconds
- * @dsc:			msm_display_dsc_config pointer, for DSC-enabled encoders
+ * @dsc:			drm_dsc_config pointer, for DSC-enabled encoders
  */
 struct dpu_encoder_virt {
 	struct drm_encoder base;
@@ -208,7 +211,7 @@ struct dpu_encoder_virt {
 	bool wide_bus_en;
 
 	/* DSC configuration */
-	struct msm_display_dsc_config *dsc;
+	struct drm_dsc_config *dsc;
 };
 
 #define to_dpu_encoder_virt(x) container_of(x, struct dpu_encoder_virt, base)
@@ -223,6 +226,13 @@ bool dpu_encoder_is_widebus_enabled(const struct drm_encoder *drm_enc)
 	const struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
 
 	return dpu_enc->wide_bus_en;
+}
+
+bool dpu_encoder_is_dsc_enabled(const struct drm_encoder *drm_enc)
+{
+	const struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
+
+	return dpu_enc->dsc ? true : false;
 }
 
 int dpu_encoder_get_crc_values_cnt(const struct drm_encoder *drm_enc)
@@ -257,7 +267,7 @@ void dpu_encoder_setup_misr(const struct drm_encoder *drm_enc)
 		if (!phys->hw_intf || !phys->hw_intf->ops.setup_misr)
 			continue;
 
-		phys->hw_intf->ops.setup_misr(phys->hw_intf, true, 1);
+		phys->hw_intf->ops.setup_misr(phys->hw_intf);
 	}
 }
 
@@ -654,7 +664,7 @@ static int dpu_encoder_virt_atomic_check(
 		if (drm_atomic_crtc_needs_modeset(crtc_state)) {
 			dpu_rm_release(global_state, drm_enc);
 
-			if (!crtc_state->active_changed || crtc_state->active)
+			if (!crtc_state->active_changed || crtc_state->enable)
 				ret = dpu_rm_reserve(&dpu_kms->rm, global_state,
 						drm_enc, crtc_state, topology);
 		}
@@ -1795,12 +1805,12 @@ static void dpu_encoder_vsync_event_work_handler(struct kthread_work *work)
 }
 
 static u32
-dpu_encoder_dsc_initial_line_calc(struct msm_display_dsc_config *dsc,
+dpu_encoder_dsc_initial_line_calc(struct drm_dsc_config *dsc,
 				  u32 enc_ip_width)
 {
 	int ssm_delay, total_pixels, soft_slice_per_enc;
 
-	soft_slice_per_enc = enc_ip_width / dsc->drm->slice_width;
+	soft_slice_per_enc = enc_ip_width / dsc->slice_width;
 
 	/*
 	 * minimum number of initial line pixels is a sum of:
@@ -1812,16 +1822,16 @@ dpu_encoder_dsc_initial_line_calc(struct msm_display_dsc_config *dsc,
 	 * 5. 6 additional pixels as the output of the rate buffer is
 	 *    48 bits wide
 	 */
-	ssm_delay = ((dsc->drm->bits_per_component < 10) ? 84 : 92);
-	total_pixels = ssm_delay * 3 + dsc->drm->initial_xmit_delay + 47;
+	ssm_delay = ((dsc->bits_per_component < 10) ? 84 : 92);
+	total_pixels = ssm_delay * 3 + dsc->initial_xmit_delay + 47;
 	if (soft_slice_per_enc > 1)
 		total_pixels += (ssm_delay * 3);
-	return DIV_ROUND_UP(total_pixels, dsc->drm->slice_width);
+	return DIV_ROUND_UP(total_pixels, dsc->slice_width);
 }
 
 static void dpu_encoder_dsc_pipe_cfg(struct dpu_hw_dsc *hw_dsc,
 				     struct dpu_hw_pingpong *hw_pp,
-				     struct msm_display_dsc_config *dsc,
+				     struct drm_dsc_config *dsc,
 				     u32 common_mode,
 				     u32 initial_lines)
 {
@@ -1839,7 +1849,7 @@ static void dpu_encoder_dsc_pipe_cfg(struct dpu_hw_dsc *hw_dsc,
 }
 
 static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
-				 struct msm_display_dsc_config *dsc)
+				 struct drm_dsc_config *dsc)
 {
 	/* coding only for 2LM, 2enc, 1 dsc config */
 	struct dpu_encoder_phys *enc_master = dpu_enc->cur_master;
@@ -1862,14 +1872,17 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
 		}
 	}
 
-	pic_width = dsc->drm->pic_width;
+	dsc_common_mode = 0;
+	pic_width = dsc->pic_width;
 
-	dsc_common_mode = DSC_MODE_MULTIPLEX | DSC_MODE_SPLIT_PANEL;
+	dsc_common_mode = DSC_MODE_SPLIT_PANEL;
+	if (dpu_encoder_use_dsc_merge(enc_master->parent))
+		dsc_common_mode |= DSC_MODE_MULTIPLEX;
 	if (enc_master->intf_mode == INTF_MODE_VIDEO)
 		dsc_common_mode |= DSC_MODE_VIDEO;
 
-	this_frame_slices = pic_width / dsc->drm->slice_width;
-	intf_ip_w = this_frame_slices * dsc->drm->slice_width;
+	this_frame_slices = pic_width / dsc->slice_width;
+	intf_ip_w = this_frame_slices * dsc->slice_width;
 
 	/*
 	 * dsc merge case: when using 2 encoders for the same stream,
@@ -1984,7 +1997,6 @@ static void dpu_encoder_helper_reset_mixers(struct dpu_encoder_phys *phys_enc)
 {
 	struct dpu_hw_mixer_cfg mixer;
 	int i, num_lm;
-	u32 flush_mask = 0;
 	struct dpu_global_state *global_state;
 	struct dpu_hw_blk *hw_lm[2];
 	struct dpu_hw_mixer *hw_mixer[2];
@@ -2003,9 +2015,8 @@ static void dpu_encoder_helper_reset_mixers(struct dpu_encoder_phys *phys_enc)
 
 	for (i = 0; i < num_lm; i++) {
 		hw_mixer[i] = to_dpu_hw_mixer(hw_lm[i]);
-		flush_mask = phys_enc->hw_ctl->ops.get_bitmask_mixer(ctl, hw_mixer[i]->idx);
-		if (phys_enc->hw_ctl->ops.update_pending_flush)
-			phys_enc->hw_ctl->ops.update_pending_flush(ctl, flush_mask);
+		if (phys_enc->hw_ctl->ops.update_pending_flush_mixer)
+			phys_enc->hw_ctl->ops.update_pending_flush_mixer(ctl, hw_mixer[i]->idx);
 
 		/* clear all blendstages */
 		if (phys_enc->hw_ctl->ops.setup_blendstage)
@@ -2055,7 +2066,7 @@ void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
 	}
 
 	/* reset the merge 3D HW block */
-	if (phys_enc->hw_pp->merge_3d) {
+	if (phys_enc->hw_pp && phys_enc->hw_pp->merge_3d) {
 		phys_enc->hw_pp->merge_3d->ops.setup_3d_mode(phys_enc->hw_pp->merge_3d,
 				BLEND_3D_NONE);
 		if (phys_enc->hw_ctl->ops.update_pending_flush_merge_3d)
@@ -2065,7 +2076,13 @@ void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
 
 	intf_cfg.stream_sel = 0; /* Don't care value for video mode */
 	intf_cfg.mode_3d = dpu_encoder_helper_get_3d_blend_mode(phys_enc);
-	if (phys_enc->hw_pp->merge_3d)
+
+	if (phys_enc->hw_intf)
+		intf_cfg.intf = phys_enc->hw_intf->idx;
+	if (phys_enc->hw_wb)
+		intf_cfg.wb = phys_enc->hw_wb->idx;
+
+	if (phys_enc->hw_pp && phys_enc->hw_pp->merge_3d)
 		intf_cfg.merge_3d = phys_enc->hw_pp->merge_3d->idx;
 
 	if (ctl->ops.reset_intf_cfg)
@@ -2384,7 +2401,7 @@ static void dpu_encoder_frame_done_timeout(struct timer_list *t)
 		return;
 	}
 
-	DPU_ERROR_ENC(dpu_enc, "frame done timeout\n");
+	DPU_ERROR_ENC_RATELIMITED(dpu_enc, "frame done timeout\n");
 
 	event = DPU_ENCODER_FRAME_EVENT_ERROR;
 	trace_dpu_enc_frame_done_timeout(DRMID(drm_enc), event);

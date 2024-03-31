@@ -283,7 +283,9 @@ static const char *const rqf_name[] = {
 	RQF_NAME(SPECIAL_PAYLOAD),
 	RQF_NAME(ZONE_WRITE_LOCKED),
 	RQF_NAME(MQ_POLL_SLEPT),
+	RQF_NAME(TIMED_OUT),
 	RQF_NAME(ELV),
+	RQF_NAME(RESV),
 };
 #undef RQF_NAME
 
@@ -425,7 +427,7 @@ static void blk_mq_debugfs_tags_show(struct seq_file *m,
 	seq_printf(m, "nr_tags=%u\n", tags->nr_tags);
 	seq_printf(m, "nr_reserved_tags=%u\n", tags->nr_reserved_tags);
 	seq_printf(m, "active_queues=%d\n",
-		   atomic_read(&tags->active_queues));
+		   READ_ONCE(tags->active_queues));
 
 	seq_puts(m, "\nbitmap_tags:\n");
 	sbitmap_queue_show(&tags->bitmap_tags, m);
@@ -805,8 +807,6 @@ static const char *rq_qos_id_to_name(enum rq_qos_id id)
 		return "latency";
 	case RQ_QOS_COST:
 		return "cost";
-	case RQ_QOS_IOPRIO:
-		return "ioprio";
 	}
 	return "unknown";
 }

@@ -391,18 +391,17 @@ static int mt7615_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 
 	if (cmd == SET_KEY)
 		*wcid_keyidx = idx;
-	else if (idx == *wcid_keyidx)
-		*wcid_keyidx = -1;
-	else
+	else {
+		if (idx == *wcid_keyidx)
+			*wcid_keyidx = -1;
 		goto out;
+	}
 
-	mt76_wcid_key_setup(&dev->mt76, wcid,
-			    cmd == SET_KEY ? key : NULL);
-
+	mt76_wcid_key_setup(&dev->mt76, wcid, key);
 	if (mt76_is_mmio(&dev->mt76))
-		err = mt7615_mac_wtbl_set_key(dev, wcid, key, cmd);
+		err = mt7615_mac_wtbl_set_key(dev, wcid, key);
 	else
-		err = __mt7615_mac_wtbl_set_key(dev, wcid, key, cmd);
+		err = __mt7615_mac_wtbl_set_key(dev, wcid, key);
 
 out:
 	mt7615_mutex_release(dev);
@@ -1195,12 +1194,16 @@ static void mt7615_sta_set_decap_offload(struct ieee80211_hw *hw,
 	struct mt7615_dev *dev = mt7615_hw_dev(hw);
 	struct mt7615_sta *msta = (struct mt7615_sta *)sta->drv_priv;
 
+	mt7615_mutex_acquire(dev);
+
 	if (enabled)
 		set_bit(MT_WCID_FLAG_HDR_TRANS, &msta->wcid.flags);
 	else
 		clear_bit(MT_WCID_FLAG_HDR_TRANS, &msta->wcid.flags);
 
 	mt7615_mcu_set_sta_decap_offload(dev, vif, sta);
+
+	mt7615_mutex_release(dev);
 }
 
 #ifdef CONFIG_PM

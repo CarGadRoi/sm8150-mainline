@@ -258,8 +258,11 @@ static int aldebaran_tables_init(struct smu_context *smu)
 	}
 
 	smu_table->ecc_table = kzalloc(tables[SMU_TABLE_ECCINFO].size, GFP_KERNEL);
-	if (!smu_table->ecc_table)
+	if (!smu_table->ecc_table) {
+		kfree(smu_table->metrics_table);
+		kfree(smu_table->gpu_metrics_table);
 		return -ENOMEM;
+	}
 
 	return 0;
 }
@@ -1640,6 +1643,15 @@ static bool aldebaran_is_baco_supported(struct smu_context *smu)
 static int aldebaran_set_df_cstate(struct smu_context *smu,
 				   enum pp_df_cstate state)
 {
+	struct amdgpu_device *adev = smu->adev;
+
+	/*
+	 * Aldebaran does not need the cstate disablement
+	 * prerequisite for gpu reset.
+	 */
+	if (amdgpu_in_reset(adev) || adev->in_suspend)
+		return 0;
+
 	return smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_DFCstateControl, state, NULL);
 }
 

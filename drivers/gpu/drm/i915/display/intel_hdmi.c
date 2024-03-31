@@ -50,6 +50,7 @@
 #include "intel_dp.h"
 #include "intel_gmbus.h"
 #include "intel_hdcp.h"
+#include "intel_hdcp_regs.h"
 #include "intel_hdmi.h"
 #include "intel_lspcon.h"
 #include "intel_panel.h"
@@ -1891,7 +1892,7 @@ int intel_hdmi_tmds_clock(int clock, int bpc, bool ycbcr420_output)
 	 *  1.5x for 12bpc
 	 *  1.25x for 10bpc
 	 */
-	return clock * bpc / 8;
+	return DIV_ROUND_CLOSEST(clock * bpc, 8);
 }
 
 static bool intel_hdmi_source_bpc_possible(struct drm_i915_private *i915, int bpc)
@@ -1986,8 +1987,9 @@ intel_hdmi_mode_valid(struct drm_connector *connector,
 	bool has_hdmi_sink = intel_has_hdmi_sink(hdmi, connector->state);
 	bool ycbcr_420_only;
 
-	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
-		return MODE_NO_DBLESCAN;
+	status = intel_cpu_transcoder_mode_valid(dev_priv, mode);
+	if (status != MODE_OK)
+		return status;
 
 	if ((mode->flags & DRM_MODE_FLAG_3D_MASK) == DRM_MODE_FLAG_3D_FRAME_PACKING)
 		clock *= 2;
@@ -2000,6 +2002,15 @@ intel_hdmi_mode_valid(struct drm_connector *connector,
 			return MODE_CLOCK_LOW;
 		clock *= 2;
 	}
+
+	/*
+	 * HDMI2.1 requires higher resolution modes like 8k60, 4K120 to be
+	 * enumerated only if FRL is supported. Current platforms do not support
+	 * FRL so prune the higher resolution modes that require doctclock more
+	 * than 600MHz.
+	 */
+	if (clock > 600000)
+		return MODE_CLOCK_HIGH;
 
 	ycbcr_420_only = drm_mode_is_420_only(&connector->display_info, mode);
 

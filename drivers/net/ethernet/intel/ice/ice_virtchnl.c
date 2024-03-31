@@ -440,7 +440,6 @@ static int ice_vc_get_vf_res_msg(struct ice_vf *vf, u8 *msg)
 		vf->driver_caps = *(u32 *)msg;
 	else
 		vf->driver_caps = VIRTCHNL_VF_OFFLOAD_L2 |
-				  VIRTCHNL_VF_OFFLOAD_RSS_REG |
 				  VIRTCHNL_VF_OFFLOAD_VLAN;
 
 	vfres->vf_cap_flags = VIRTCHNL_VF_OFFLOAD_L2;
@@ -453,14 +452,8 @@ static int ice_vc_get_vf_res_msg(struct ice_vf *vf, u8 *msg)
 	vfres->vf_cap_flags |= ice_vc_get_vlan_caps(hw, vf, vsi,
 						    vf->driver_caps);
 
-	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RSS_PF) {
+	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RSS_PF)
 		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_RSS_PF;
-	} else {
-		if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RSS_AQ)
-			vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_RSS_AQ;
-		else
-			vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_RSS_REG;
-	}
 
 	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_FDIR_PF)
 		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_FDIR_PF;
@@ -817,8 +810,8 @@ static int ice_vc_handle_rss_cfg(struct ice_vf *vf, u8 *msg, bool add)
 		int status;
 
 		lut_type = ICE_AQ_VSI_Q_OPT_RSS_LUT_VSI;
-		hash_type = add ? ICE_AQ_VSI_Q_OPT_RSS_XOR :
-				ICE_AQ_VSI_Q_OPT_RSS_TPLZ;
+		hash_type = add ? ICE_AQ_VSI_Q_OPT_RSS_HASH_XOR :
+				ICE_AQ_VSI_Q_OPT_RSS_HASH_TPLZ;
 
 		ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 		if (!ctx) {
@@ -826,11 +819,9 @@ static int ice_vc_handle_rss_cfg(struct ice_vf *vf, u8 *msg, bool add)
 			goto error_param;
 		}
 
-		ctx->info.q_opt_rss = ((lut_type <<
-					ICE_AQ_VSI_Q_OPT_RSS_LUT_S) &
-				       ICE_AQ_VSI_Q_OPT_RSS_LUT_M) |
-				       (hash_type &
-					ICE_AQ_VSI_Q_OPT_RSS_HASH_M);
+		ctx->info.q_opt_rss =
+			FIELD_PREP(ICE_AQ_VSI_Q_OPT_RSS_LUT_M, lut_type) |
+			FIELD_PREP(ICE_AQ_VSI_Q_OPT_RSS_HASH_M, hash_type);
 
 		/* Preserve existing queueing option setting */
 		ctx->info.q_opt_rss |= (vsi->info.q_opt_rss &
@@ -2288,6 +2279,15 @@ static int ice_vc_process_vlan_msg(struct ice_vf *vf, u8 *msg, bool add_v)
 
 			/* Enable VLAN filtering on first non-zero VLAN */
 			if (!vlan_promisc && vid && !ice_is_dvm_ena(&pf->hw)) {
+				if (vf->spoofchk) {
+					status = vsi->inner_vlan_ops.ena_tx_filtering(vsi);
+					if (status) {
+						v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+						dev_err(dev, "Enable VLAN anti-spoofing on VLAN ID: %d failed error-%d\n",
+							vid, status);
+						goto error_param;
+					}
+				}
 				if (vsi->inner_vlan_ops.ena_rx_filtering(vsi)) {
 					v_ret = VIRTCHNL_STATUS_ERR_PARAM;
 					dev_err(dev, "Enable VLAN pruning on VLAN ID: %d failed error-%d\n",
@@ -2333,8 +2333,10 @@ static int ice_vc_process_vlan_msg(struct ice_vf *vf, u8 *msg, bool add_v)
 			}
 
 			/* Disable VLAN filtering when only VLAN 0 is left */
-			if (!ice_vsi_has_non_zero_vlans(vsi))
+			if (!ice_vsi_has_non_zero_vlans(vsi)) {
+				vsi->inner_vlan_ops.dis_tx_filtering(vsi);
 				vsi->inner_vlan_ops.dis_rx_filtering(vsi);
+			}
 
 			if (vlan_promisc)
 				ice_vf_dis_vlan_promisc(vsi, &vlan);
@@ -2838,6 +2840,13 @@ ice_vc_del_vlans(struct ice_vf *vf, struct ice_vsi *vsi,
 
 			if (vlan_promisc)
 				ice_vf_dis_vlan_promisc(vsi, &vlan);
+
+			/* Disable VLAN filtering when only VLAN 0 is left */
+			if (!ice_vsi_has_non_zero_vlans(vsi) && ice_is_dvm_ena(&vsi->back->hw)) {
+				err = vsi->outer_vlan_ops.dis_tx_filtering(vsi);
+				if (err)
+					return err;
+			}
 		}
 
 		vc_vlan = &vlan_fltr->inner;
@@ -2853,8 +2862,17 @@ ice_vc_del_vlans(struct ice_vf *vf, struct ice_vsi *vsi,
 			/* no support for VLAN promiscuous on inner VLAN unless
 			 * we are in Single VLAN Mode (SVM)
 			 */
-			if (!ice_is_dvm_ena(&vsi->back->hw) && vlan_promisc)
-				ice_vf_dis_vlan_promisc(vsi, &vlan);
+			if (!ice_is_dvm_ena(&vsi->back->hw)) {
+				if (vlan_promisc)
+					ice_vf_dis_vlan_promisc(vsi, &vlan);
+
+				/* Disable VLAN filtering when only VLAN 0 is left */
+				if (!ice_vsi_has_non_zero_vlans(vsi)) {
+					err = vsi->inner_vlan_ops.dis_tx_filtering(vsi);
+					if (err)
+						return err;
+				}
+			}
 		}
 	}
 
@@ -2931,6 +2949,13 @@ ice_vc_add_vlans(struct ice_vf *vf, struct ice_vsi *vsi,
 				if (err)
 					return err;
 			}
+
+			/* Enable VLAN filtering on first non-zero VLAN */
+			if (vf->spoofchk && vlan.vid && ice_is_dvm_ena(&vsi->back->hw)) {
+				err = vsi->outer_vlan_ops.ena_tx_filtering(vsi);
+				if (err)
+					return err;
+			}
 		}
 
 		vc_vlan = &vlan_fltr->inner;
@@ -2946,10 +2971,19 @@ ice_vc_add_vlans(struct ice_vf *vf, struct ice_vsi *vsi,
 			/* no support for VLAN promiscuous on inner VLAN unless
 			 * we are in Single VLAN Mode (SVM)
 			 */
-			if (!ice_is_dvm_ena(&vsi->back->hw) && vlan_promisc) {
-				err = ice_vf_ena_vlan_promisc(vsi, &vlan);
-				if (err)
-					return err;
+			if (!ice_is_dvm_ena(&vsi->back->hw)) {
+				if (vlan_promisc) {
+					err = ice_vf_ena_vlan_promisc(vsi, &vlan);
+					if (err)
+						return err;
+				}
+
+				/* Enable VLAN filtering on first non-zero VLAN */
+				if (vf->spoofchk && vlan.vid) {
+					err = vsi->inner_vlan_ops.ena_tx_filtering(vsi);
+					if (err)
+						return err;
+				}
 			}
 		}
 	}

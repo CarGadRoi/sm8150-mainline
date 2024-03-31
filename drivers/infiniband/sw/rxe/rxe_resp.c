@@ -91,7 +91,10 @@ void rxe_resp_queue_pkt(struct rxe_qp *qp, struct sk_buff *skb)
 	must_sched = (pkt->opcode == IB_OPCODE_RC_RDMA_READ_REQUEST) ||
 			(skb_queue_len(&qp->req_pkts) > 1);
 
-	rxe_run_task(&qp->resp.task, must_sched);
+	if (must_sched)
+		rxe_sched_task(&qp->resp.task);
+	else
+		rxe_run_task(&qp->resp.task);
 }
 
 static inline enum resp_states get_req(struct rxe_qp *qp,
@@ -466,8 +469,9 @@ static enum resp_states check_rkey(struct rxe_qp *qp,
 		if (mw->access & IB_ZERO_BASED)
 			qp->resp.offset = mw->addr;
 
-		rxe_put(mw);
 		rxe_get(mr);
+		rxe_put(mw);
+		mw = NULL;
 	} else {
 		mr = lookup_mr(qp->pd, access, rkey, RXE_LOOKUP_REMOTE);
 		if (!mr) {
@@ -806,13 +810,13 @@ static enum resp_states read_reply(struct rxe_qp *qp,
 
 	skb = prepare_ack_packet(qp, &ack_pkt, opcode, payload,
 				 res->cur_psn, AETH_ACK_UNLIMITED);
-	if (!skb)
+	if (!skb) {
+		rxe_put(mr);
 		return RESPST_ERR_RNR;
+	}
 
-	err = rxe_mr_copy(mr, res->read.va, payload_addr(&ack_pkt),
-			  payload, RXE_FROM_MR_OBJ);
-	if (err)
-		pr_err("Failed copying memory\n");
+	rxe_mr_copy(mr, res->read.va, payload_addr(&ack_pkt),
+		    payload, RXE_FROM_MR_OBJ);
 	if (mr)
 		rxe_put(mr);
 
@@ -823,10 +827,8 @@ static enum resp_states read_reply(struct rxe_qp *qp,
 	}
 
 	err = rxe_xmit_packet(qp, &ack_pkt, skb);
-	if (err) {
-		pr_err("Failed sending RDMA reply.\n");
+	if (err)
 		return RESPST_ERR_RNR;
-	}
 
 	res->read.va += payload;
 	res->read.resid -= payload;
@@ -1028,50 +1030,41 @@ finish:
 		return RESPST_CLEANUP;
 }
 
-static int send_ack(struct rxe_qp *qp, u8 syndrome, u32 psn)
+
+static int send_common_ack(struct rxe_qp *qp, u8 syndrome, u32 psn,
+				  int opcode, const char *msg)
 {
-	int err = 0;
+	int err;
 	struct rxe_pkt_info ack_pkt;
 	struct sk_buff *skb;
 
-	skb = prepare_ack_packet(qp, &ack_pkt, IB_OPCODE_RC_ACKNOWLEDGE,
-				 0, psn, syndrome);
-	if (!skb) {
-		err = -ENOMEM;
-		goto err1;
-	}
+	skb = prepare_ack_packet(qp, &ack_pkt, opcode, 0, psn, syndrome);
+	if (!skb)
+		return -ENOMEM;
 
 	err = rxe_xmit_packet(qp, &ack_pkt, skb);
 	if (err)
-		pr_err_ratelimited("Failed sending ack\n");
+		pr_err_ratelimited("Failed sending %s\n", msg);
 
-err1:
 	return err;
+}
+
+static int send_ack(struct rxe_qp *qp, u8 syndrome, u32 psn)
+{
+	return send_common_ack(qp, syndrome, psn,
+			IB_OPCODE_RC_ACKNOWLEDGE, "ACK");
 }
 
 static int send_atomic_ack(struct rxe_qp *qp, u8 syndrome, u32 psn)
 {
-	int err = 0;
-	struct rxe_pkt_info ack_pkt;
-	struct sk_buff *skb;
-
-	skb = prepare_ack_packet(qp, &ack_pkt, IB_OPCODE_RC_ATOMIC_ACKNOWLEDGE,
-				 0, psn, syndrome);
-	if (!skb) {
-		err = -ENOMEM;
-		goto out;
-	}
-
-	err = rxe_xmit_packet(qp, &ack_pkt, skb);
-	if (err)
-		pr_err_ratelimited("Failed sending atomic ack\n");
+	int ret = send_common_ack(qp, syndrome, psn,
+			IB_OPCODE_RC_ATOMIC_ACKNOWLEDGE, "ATOMIC ACK");
 
 	/* have to clear this since it is used to trigger
 	 * long read replies
 	 */
 	qp->resp.res = NULL;
-out:
-	return err;
+	return ret;
 }
 
 static enum resp_states acknowledge(struct rxe_qp *qp,

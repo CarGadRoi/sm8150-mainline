@@ -39,15 +39,18 @@ static int irdma_query_device(struct ib_device *ibdev,
 	props->max_send_sge = hw_attrs->uk_attrs.max_hw_wq_frags;
 	props->max_recv_sge = hw_attrs->uk_attrs.max_hw_wq_frags;
 	props->max_cq = rf->max_cq - rf->used_cqs;
-	props->max_cqe = rf->max_cqe;
+	props->max_cqe = rf->max_cqe - 1;
 	props->max_mr = rf->max_mr - rf->used_mrs;
 	props->max_mw = props->max_mr;
 	props->max_pd = rf->max_pd - rf->used_pds;
 	props->max_sge_rd = hw_attrs->uk_attrs.max_hw_read_sges;
 	props->max_qp_rd_atom = hw_attrs->max_hw_ird;
 	props->max_qp_init_rd_atom = hw_attrs->max_hw_ord;
-	if (rdma_protocol_roce(ibdev, 1))
+	if (rdma_protocol_roce(ibdev, 1)) {
+		props->device_cap_flags |= IB_DEVICE_RC_RNR_NAK_GEN;
 		props->max_pkeys = IRDMA_PKEY_TBL_SZ;
+	}
+
 	props->max_ah = rf->max_ah;
 	props->max_mcast_grp = rf->max_mcg;
 	props->max_mcast_qp_attach = IRDMA_MAX_MGS_PER_CTX;
@@ -58,36 +61,6 @@ static int irdma_query_device(struct ib_device *ibdev,
 		props->timestamp_mask = HCA_CLOCK_TIMESTAMP_MASK;
 
 	return 0;
-}
-
-/**
- * irdma_get_eth_speed_and_width - Get IB port speed and width from netdev speed
- * @link_speed: netdev phy link speed
- * @active_speed: IB port speed
- * @active_width: IB port width
- */
-static void irdma_get_eth_speed_and_width(u32 link_speed, u16 *active_speed,
-					  u8 *active_width)
-{
-	if (link_speed <= SPEED_1000) {
-		*active_width = IB_WIDTH_1X;
-		*active_speed = IB_SPEED_SDR;
-	} else if (link_speed <= SPEED_10000) {
-		*active_width = IB_WIDTH_1X;
-		*active_speed = IB_SPEED_FDR10;
-	} else if (link_speed <= SPEED_20000) {
-		*active_width = IB_WIDTH_4X;
-		*active_speed = IB_SPEED_DDR;
-	} else if (link_speed <= SPEED_25000) {
-		*active_width = IB_WIDTH_1X;
-		*active_speed = IB_SPEED_EDR;
-	} else if (link_speed <= SPEED_40000) {
-		*active_width = IB_WIDTH_4X;
-		*active_speed = IB_SPEED_FDR10;
-	} else {
-		*active_width = IB_WIDTH_4X;
-		*active_speed = IB_SPEED_EDR;
-	}
 }
 
 /**
@@ -117,8 +90,9 @@ static int irdma_query_port(struct ib_device *ibdev, u32 port,
 		props->state = IB_PORT_DOWN;
 		props->phys_state = IB_PORT_PHYS_STATE_DISABLED;
 	}
-	irdma_get_eth_speed_and_width(SPEED_100000, &props->active_speed,
-				      &props->active_width);
+
+	ib_get_eth_speed(ibdev, port, &props->active_speed,
+			 &props->active_width);
 
 	if (rdma_protocol_roce(ibdev, 1)) {
 		props->gid_tbl_len = 32;
@@ -296,12 +270,18 @@ static void irdma_alloc_push_page(struct irdma_qp *iwqp)
 static int irdma_alloc_ucontext(struct ib_ucontext *uctx,
 				struct ib_udata *udata)
 {
+#define IRDMA_ALLOC_UCTX_MIN_REQ_LEN offsetofend(struct irdma_alloc_ucontext_req, rsvd8)
+#define IRDMA_ALLOC_UCTX_MIN_RESP_LEN offsetofend(struct irdma_alloc_ucontext_resp, rsvd)
 	struct ib_device *ibdev = uctx->device;
 	struct irdma_device *iwdev = to_iwdev(ibdev);
-	struct irdma_alloc_ucontext_req req;
+	struct irdma_alloc_ucontext_req req = {};
 	struct irdma_alloc_ucontext_resp uresp = {};
 	struct irdma_ucontext *ucontext = to_ucontext(uctx);
-	struct irdma_uk_attrs *uk_attrs;
+	struct irdma_uk_attrs *uk_attrs = &iwdev->rf->sc_dev.hw_attrs.uk_attrs;
+
+	if (udata->inlen < IRDMA_ALLOC_UCTX_MIN_REQ_LEN ||
+	    udata->outlen < IRDMA_ALLOC_UCTX_MIN_RESP_LEN)
+		return -EINVAL;
 
 	if (ib_copy_from_udata(&req, udata, min(sizeof(req), udata->inlen)))
 		return -EINVAL;
@@ -312,9 +292,11 @@ static int irdma_alloc_ucontext(struct ib_ucontext *uctx,
 	ucontext->iwdev = iwdev;
 	ucontext->abi_ver = req.userspace_ver;
 
-	uk_attrs = &iwdev->rf->sc_dev.hw_attrs.uk_attrs;
+	if (req.comp_mask & IRDMA_ALLOC_UCTX_USE_RAW_ATTR)
+		ucontext->use_raw_attrs = true;
+
 	/* GEN_1 legacy support with libi40iw */
-	if (udata->outlen < sizeof(uresp)) {
+	if (udata->outlen == IRDMA_ALLOC_UCTX_MIN_RESP_LEN) {
 		if (uk_attrs->hw_rev != IRDMA_GEN_1)
 			return -EOPNOTSUPP;
 
@@ -347,6 +329,7 @@ static int irdma_alloc_ucontext(struct ib_ucontext *uctx,
 		uresp.max_hw_cq_size = uk_attrs->max_hw_cq_size;
 		uresp.min_hw_cq_size = uk_attrs->min_hw_cq_size;
 		uresp.hw_rev = uk_attrs->hw_rev;
+		uresp.comp_mask |= IRDMA_ALLOC_UCTX_USE_RAW_ATTR;
 		if (ib_copy_to_udata(udata, &uresp,
 				     min(sizeof(uresp), udata->outlen))) {
 			rdma_user_mmap_entry_remove(ucontext->db_mmap_entry);
@@ -386,6 +369,7 @@ static void irdma_dealloc_ucontext(struct ib_ucontext *context)
  */
 static int irdma_alloc_pd(struct ib_pd *pd, struct ib_udata *udata)
 {
+#define IRDMA_ALLOC_PD_MIN_RESP_LEN offsetofend(struct irdma_alloc_pd_resp, rsvd)
 	struct irdma_pd *iwpd = to_iwpd(pd);
 	struct irdma_device *iwdev = to_iwdev(pd->device);
 	struct irdma_sc_dev *dev = &iwdev->rf->sc_dev;
@@ -394,6 +378,9 @@ static int irdma_alloc_pd(struct ib_pd *pd, struct ib_udata *udata)
 	struct irdma_sc_pd *sc_pd;
 	u32 pd_id = 0;
 	int err;
+
+	if (udata && udata->outlen < IRDMA_ALLOC_PD_MIN_RESP_LEN)
+		return -EINVAL;
 
 	err = irdma_alloc_rsrc(rf, rf->allocated_pds, rf->max_pd, &pd_id,
 			       &rf->next_pd);
@@ -538,11 +525,6 @@ static int irdma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	if (!iwqp->user_mode)
 		cancel_delayed_work_sync(&iwqp->dwork_flush);
 
-	irdma_qp_rem_ref(&iwqp->ibqp);
-	wait_for_completion(&iwqp->free_qp);
-	irdma_free_lsmm_rsrc(iwqp);
-	irdma_cqp_qp_destroy_cmd(&iwdev->rf->sc_dev, &iwqp->sc_qp);
-
 	if (!iwqp->user_mode) {
 		if (iwqp->iwscq) {
 			irdma_clean_cqes(iwqp, iwqp->iwscq);
@@ -550,6 +532,12 @@ static int irdma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 				irdma_clean_cqes(iwqp, iwqp->iwrcq);
 		}
 	}
+
+	irdma_qp_rem_ref(&iwqp->ibqp);
+	wait_for_completion(&iwqp->free_qp);
+	irdma_free_lsmm_rsrc(iwqp);
+	irdma_cqp_qp_destroy_cmd(&iwdev->rf->sc_dev, &iwqp->sc_qp);
+
 	irdma_remove_push_mmap_entries(iwqp);
 	irdma_free_qp_rsrc(iwqp);
 
@@ -582,6 +570,86 @@ static void irdma_setup_virt_qp(struct irdma_device *iwdev,
 }
 
 /**
+ * irdma_setup_umode_qp - setup sq and rq size in user mode qp
+ * @iwdev: iwarp device
+ * @iwqp: qp ptr (user or kernel)
+ * @info: initialize info to return
+ * @init_attr: Initial QP create attributes
+ */
+static int irdma_setup_umode_qp(struct ib_udata *udata,
+				struct irdma_device *iwdev,
+				struct irdma_qp *iwqp,
+				struct irdma_qp_init_info *info,
+				struct ib_qp_init_attr *init_attr)
+{
+	struct irdma_ucontext *ucontext = rdma_udata_to_drv_context(udata,
+				struct irdma_ucontext, ibucontext);
+	struct irdma_qp_uk_init_info *ukinfo = &info->qp_uk_init_info;
+	struct irdma_create_qp_req req;
+	unsigned long flags;
+	int ret;
+
+	ret = ib_copy_from_udata(&req, udata,
+				 min(sizeof(req), udata->inlen));
+	if (ret) {
+		ibdev_dbg(&iwdev->ibdev, "VERBS: ib_copy_from_data fail\n");
+		return ret;
+	}
+
+	iwqp->ctx_info.qp_compl_ctx = req.user_compl_ctx;
+	iwqp->user_mode = 1;
+	if (req.user_wqe_bufs) {
+		info->qp_uk_init_info.legacy_mode = ucontext->legacy_mode;
+		spin_lock_irqsave(&ucontext->qp_reg_mem_list_lock, flags);
+		iwqp->iwpbl = irdma_get_pbl((unsigned long)req.user_wqe_bufs,
+					    &ucontext->qp_reg_mem_list);
+		spin_unlock_irqrestore(&ucontext->qp_reg_mem_list_lock, flags);
+
+		if (!iwqp->iwpbl) {
+			ret = -ENODATA;
+			ibdev_dbg(&iwdev->ibdev, "VERBS: no pbl info\n");
+			return ret;
+		}
+	}
+
+	if (!ucontext->use_raw_attrs) {
+		/**
+		 * Maintain backward compat with older ABI which passes sq and
+		 * rq depth in quanta in cap.max_send_wr and cap.max_recv_wr.
+		 * There is no way to compute the correct value of
+		 * iwqp->max_send_wr/max_recv_wr in the kernel.
+		 */
+		iwqp->max_send_wr = init_attr->cap.max_send_wr;
+		iwqp->max_recv_wr = init_attr->cap.max_recv_wr;
+		ukinfo->sq_size = init_attr->cap.max_send_wr;
+		ukinfo->rq_size = init_attr->cap.max_recv_wr;
+		irdma_uk_calc_shift_wq(ukinfo, &ukinfo->sq_shift,
+				       &ukinfo->rq_shift);
+	} else {
+		ret = irdma_uk_calc_depth_shift_sq(ukinfo, &ukinfo->sq_depth,
+						   &ukinfo->sq_shift);
+		if (ret)
+			return ret;
+
+		ret = irdma_uk_calc_depth_shift_rq(ukinfo, &ukinfo->rq_depth,
+						   &ukinfo->rq_shift);
+		if (ret)
+			return ret;
+
+		iwqp->max_send_wr =
+			(ukinfo->sq_depth - IRDMA_SQ_RSVD) >> ukinfo->sq_shift;
+		iwqp->max_recv_wr =
+			(ukinfo->rq_depth - IRDMA_RQ_RSVD) >> ukinfo->rq_shift;
+		ukinfo->sq_size = ukinfo->sq_depth >> ukinfo->sq_shift;
+		ukinfo->rq_size = ukinfo->rq_depth >> ukinfo->rq_shift;
+	}
+
+	irdma_setup_virt_qp(iwdev, iwqp, info);
+
+	return 0;
+}
+
+/**
  * irdma_setup_kmode_qp - setup initialization for kernel mode qp
  * @iwdev: iwarp device
  * @iwqp: qp ptr (user or kernel)
@@ -594,40 +662,28 @@ static int irdma_setup_kmode_qp(struct irdma_device *iwdev,
 				struct ib_qp_init_attr *init_attr)
 {
 	struct irdma_dma_mem *mem = &iwqp->kqp.dma_mem;
-	u32 sqdepth, rqdepth;
-	u8 sqshift, rqshift;
 	u32 size;
 	int status;
 	struct irdma_qp_uk_init_info *ukinfo = &info->qp_uk_init_info;
-	struct irdma_uk_attrs *uk_attrs = &iwdev->rf->sc_dev.hw_attrs.uk_attrs;
 
-	irdma_get_wqe_shift(uk_attrs,
-		uk_attrs->hw_rev >= IRDMA_GEN_2 ? ukinfo->max_sq_frag_cnt + 1 :
-						  ukinfo->max_sq_frag_cnt,
-		ukinfo->max_inline_data, &sqshift);
-	status = irdma_get_sqdepth(uk_attrs, ukinfo->sq_size, sqshift,
-				   &sqdepth);
+	status = irdma_uk_calc_depth_shift_sq(ukinfo, &ukinfo->sq_depth,
+					      &ukinfo->sq_shift);
 	if (status)
 		return status;
 
-	if (uk_attrs->hw_rev == IRDMA_GEN_1)
-		rqshift = IRDMA_MAX_RQ_WQE_SHIFT_GEN1;
-	else
-		irdma_get_wqe_shift(uk_attrs, ukinfo->max_rq_frag_cnt, 0,
-				    &rqshift);
-
-	status = irdma_get_rqdepth(uk_attrs, ukinfo->rq_size, rqshift,
-				   &rqdepth);
+	status = irdma_uk_calc_depth_shift_rq(ukinfo, &ukinfo->rq_depth,
+					      &ukinfo->rq_shift);
 	if (status)
 		return status;
 
 	iwqp->kqp.sq_wrid_mem =
-		kcalloc(sqdepth, sizeof(*iwqp->kqp.sq_wrid_mem), GFP_KERNEL);
+		kcalloc(ukinfo->sq_depth, sizeof(*iwqp->kqp.sq_wrid_mem), GFP_KERNEL);
 	if (!iwqp->kqp.sq_wrid_mem)
 		return -ENOMEM;
 
 	iwqp->kqp.rq_wrid_mem =
-		kcalloc(rqdepth, sizeof(*iwqp->kqp.rq_wrid_mem), GFP_KERNEL);
+		kcalloc(ukinfo->rq_depth, sizeof(*iwqp->kqp.rq_wrid_mem), GFP_KERNEL);
+
 	if (!iwqp->kqp.rq_wrid_mem) {
 		kfree(iwqp->kqp.sq_wrid_mem);
 		iwqp->kqp.sq_wrid_mem = NULL;
@@ -637,7 +693,7 @@ static int irdma_setup_kmode_qp(struct irdma_device *iwdev,
 	ukinfo->sq_wrtrk_array = iwqp->kqp.sq_wrid_mem;
 	ukinfo->rq_wrid_array = iwqp->kqp.rq_wrid_mem;
 
-	size = (sqdepth + rqdepth) * IRDMA_QP_WQE_MIN_SIZE;
+	size = (ukinfo->sq_depth + ukinfo->rq_depth) * IRDMA_QP_WQE_MIN_SIZE;
 	size += (IRDMA_SHADOW_AREA_SIZE << 3);
 
 	mem->size = ALIGN(size, 256);
@@ -653,16 +709,18 @@ static int irdma_setup_kmode_qp(struct irdma_device *iwdev,
 
 	ukinfo->sq = mem->va;
 	info->sq_pa = mem->pa;
-	ukinfo->rq = &ukinfo->sq[sqdepth];
-	info->rq_pa = info->sq_pa + (sqdepth * IRDMA_QP_WQE_MIN_SIZE);
-	ukinfo->shadow_area = ukinfo->rq[rqdepth].elem;
-	info->shadow_area_pa = info->rq_pa + (rqdepth * IRDMA_QP_WQE_MIN_SIZE);
-	ukinfo->sq_size = sqdepth >> sqshift;
-	ukinfo->rq_size = rqdepth >> rqshift;
-	ukinfo->qp_id = iwqp->ibqp.qp_num;
+	ukinfo->rq = &ukinfo->sq[ukinfo->sq_depth];
+	info->rq_pa = info->sq_pa + (ukinfo->sq_depth * IRDMA_QP_WQE_MIN_SIZE);
+	ukinfo->shadow_area = ukinfo->rq[ukinfo->rq_depth].elem;
+	info->shadow_area_pa =
+		info->rq_pa + (ukinfo->rq_depth * IRDMA_QP_WQE_MIN_SIZE);
+	ukinfo->sq_size = ukinfo->sq_depth >> ukinfo->sq_shift;
+	ukinfo->rq_size = ukinfo->rq_depth >> ukinfo->rq_shift;
 
-	init_attr->cap.max_send_wr = (sqdepth - IRDMA_SQ_RSVD) >> sqshift;
-	init_attr->cap.max_recv_wr = (rqdepth - IRDMA_RQ_RSVD) >> rqshift;
+	iwqp->max_send_wr = (ukinfo->sq_depth - IRDMA_SQ_RSVD) >> ukinfo->sq_shift;
+	iwqp->max_recv_wr = (ukinfo->rq_depth - IRDMA_RQ_RSVD) >> ukinfo->rq_shift;
+	init_attr->cap.max_send_wr = iwqp->max_send_wr;
+	init_attr->cap.max_recv_wr = iwqp->max_recv_wr;
 
 	return 0;
 }
@@ -777,7 +835,9 @@ static int irdma_validate_qp_attrs(struct ib_qp_init_attr *init_attr,
 
 	if (init_attr->cap.max_inline_data > uk_attrs->max_hw_inline ||
 	    init_attr->cap.max_send_sge > uk_attrs->max_hw_wq_frags ||
-	    init_attr->cap.max_recv_sge > uk_attrs->max_hw_wq_frags)
+	    init_attr->cap.max_recv_sge > uk_attrs->max_hw_wq_frags ||
+	    init_attr->cap.max_send_wr > uk_attrs->max_hw_wq_quanta ||
+	    init_attr->cap.max_recv_wr > uk_attrs->max_hw_rq_quanta)
 		return -EINVAL;
 
 	if (rdma_protocol_roce(&iwdev->ibdev, 1)) {
@@ -811,35 +871,34 @@ static int irdma_create_qp(struct ib_qp *ibqp,
 			   struct ib_qp_init_attr *init_attr,
 			   struct ib_udata *udata)
 {
+#define IRDMA_CREATE_QP_MIN_REQ_LEN offsetofend(struct irdma_create_qp_req, user_compl_ctx)
+#define IRDMA_CREATE_QP_MIN_RESP_LEN offsetofend(struct irdma_create_qp_resp, rsvd)
 	struct ib_pd *ibpd = ibqp->pd;
 	struct irdma_pd *iwpd = to_iwpd(ibpd);
 	struct irdma_device *iwdev = to_iwdev(ibpd->device);
 	struct irdma_pci_f *rf = iwdev->rf;
 	struct irdma_qp *iwqp = to_iwqp(ibqp);
-	struct irdma_create_qp_req req;
 	struct irdma_create_qp_resp uresp = {};
 	u32 qp_num = 0;
 	int err_code;
-	int sq_size;
-	int rq_size;
 	struct irdma_sc_qp *qp;
 	struct irdma_sc_dev *dev = &rf->sc_dev;
 	struct irdma_uk_attrs *uk_attrs = &dev->hw_attrs.uk_attrs;
 	struct irdma_qp_init_info init_info = {};
 	struct irdma_qp_host_ctx_info *ctx_info;
-	unsigned long flags;
 
 	err_code = irdma_validate_qp_attrs(init_attr, iwdev);
 	if (err_code)
 		return err_code;
 
-	sq_size = init_attr->cap.max_send_wr;
-	rq_size = init_attr->cap.max_recv_wr;
+	if (udata && (udata->inlen < IRDMA_CREATE_QP_MIN_REQ_LEN ||
+		      udata->outlen < IRDMA_CREATE_QP_MIN_RESP_LEN))
+		return -EINVAL;
 
 	init_info.vsi = &iwdev->vsi;
 	init_info.qp_uk_init_info.uk_attrs = uk_attrs;
-	init_info.qp_uk_init_info.sq_size = sq_size;
-	init_info.qp_uk_init_info.rq_size = rq_size;
+	init_info.qp_uk_init_info.sq_size = init_attr->cap.max_send_wr;
+	init_info.qp_uk_init_info.rq_size = init_attr->cap.max_recv_wr;
 	init_info.qp_uk_init_info.max_sq_frag_cnt = init_attr->cap.max_send_sge;
 	init_info.qp_uk_init_info.max_rq_frag_cnt = init_attr->cap.max_recv_sge;
 	init_info.qp_uk_init_info.max_inline_data = init_attr->cap.max_inline_data;
@@ -881,7 +940,7 @@ static int irdma_create_qp(struct ib_qp *ibqp,
 	iwqp->host_ctx.size = IRDMA_QP_CTX_SIZE;
 
 	init_info.pd = &iwpd->sc_pd;
-	init_info.qp_uk_init_info.qp_id = iwqp->ibqp.qp_num;
+	init_info.qp_uk_init_info.qp_id = qp_num;
 	if (!rdma_protocol_roce(&iwdev->ibdev, 1))
 		init_info.qp_uk_init_info.first_sq_wq = 1;
 	iwqp->ctx_info.qp_compl_ctx = (uintptr_t)qp;
@@ -889,36 +948,9 @@ static int irdma_create_qp(struct ib_qp *ibqp,
 	init_waitqueue_head(&iwqp->mod_qp_waitq);
 
 	if (udata) {
-		err_code = ib_copy_from_udata(&req, udata,
-					      min(sizeof(req), udata->inlen));
-		if (err_code) {
-			ibdev_dbg(&iwdev->ibdev,
-				  "VERBS: ib_copy_from_data fail\n");
-			goto error;
-		}
-
-		iwqp->ctx_info.qp_compl_ctx = req.user_compl_ctx;
-		iwqp->user_mode = 1;
-		if (req.user_wqe_bufs) {
-			struct irdma_ucontext *ucontext =
-				rdma_udata_to_drv_context(udata,
-							  struct irdma_ucontext,
-							  ibucontext);
-
-			init_info.qp_uk_init_info.legacy_mode = ucontext->legacy_mode;
-			spin_lock_irqsave(&ucontext->qp_reg_mem_list_lock, flags);
-			iwqp->iwpbl = irdma_get_pbl((unsigned long)req.user_wqe_bufs,
-						    &ucontext->qp_reg_mem_list);
-			spin_unlock_irqrestore(&ucontext->qp_reg_mem_list_lock, flags);
-
-			if (!iwqp->iwpbl) {
-				err_code = -ENODATA;
-				ibdev_dbg(&iwdev->ibdev, "VERBS: no pbl info\n");
-				goto error;
-			}
-		}
 		init_info.qp_uk_init_info.abi_ver = iwpd->sc_pd.abi_ver;
-		irdma_setup_virt_qp(iwdev, iwqp, &init_info);
+		err_code = irdma_setup_umode_qp(udata, iwdev, iwqp, &init_info,
+						init_attr);
 	} else {
 		INIT_DELAYED_WORK(&iwqp->dwork_flush, irdma_flush_worker);
 		init_info.qp_uk_init_info.abi_ver = IRDMA_ABI_VER;
@@ -973,8 +1005,6 @@ static int irdma_create_qp(struct ib_qp *ibqp,
 	spin_lock_init(&iwqp->sc_qp.pfpdu.lock);
 	iwqp->sig_all = (init_attr->sq_sig_type == IB_SIGNAL_ALL_WR) ? 1 : 0;
 	rf->qp_table[qp_num] = iwqp;
-	iwqp->max_send_wr = sq_size;
-	iwqp->max_recv_wr = rq_size;
 
 	if (rdma_protocol_roce(&iwdev->ibdev, 1)) {
 		if (dev->ws_add(&iwdev->vsi, 0)) {
@@ -995,8 +1025,8 @@ static int irdma_create_qp(struct ib_qp *ibqp,
 			if (rdma_protocol_iwarp(&iwdev->ibdev, 1))
 				uresp.lsmm = 1;
 		}
-		uresp.actual_sq_size = sq_size;
-		uresp.actual_rq_size = rq_size;
+		uresp.actual_sq_size = init_info.qp_uk_init_info.sq_size;
+		uresp.actual_rq_size = init_info.qp_uk_init_info.rq_size;
 		uresp.qp_id = qp_num;
 		uresp.qp_caps = qp->qp_uk.qp_caps;
 
@@ -1107,6 +1137,21 @@ static int irdma_query_pkey(struct ib_device *ibdev, u32 port, u16 index,
 	return 0;
 }
 
+static int irdma_wait_for_suspend(struct irdma_qp *iwqp)
+{
+	if (!wait_event_timeout(iwqp->iwdev->suspend_wq,
+				!iwqp->suspend_pending,
+				msecs_to_jiffies(IRDMA_EVENT_TIMEOUT_MS))) {
+		iwqp->suspend_pending = false;
+		ibdev_warn(&iwqp->iwdev->ibdev,
+			   "modify_qp timed out waiting for suspend. qp_id = %d, last_ae = 0x%x\n",
+			   iwqp->ibqp.qp_num, iwqp->last_aeq);
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
 /**
  * irdma_modify_qp_roce - modify qp request
  * @ibqp: qp's pointer for modify
@@ -1117,6 +1162,8 @@ static int irdma_query_pkey(struct ib_device *ibdev, u32 port, u16 index,
 int irdma_modify_qp_roce(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 			 int attr_mask, struct ib_udata *udata)
 {
+#define IRDMA_MODIFY_QP_MIN_REQ_LEN offsetofend(struct irdma_modify_qp_req, rq_flush)
+#define IRDMA_MODIFY_QP_MIN_RESP_LEN offsetofend(struct irdma_modify_qp_resp, push_valid)
 	struct irdma_pd *iwpd = to_iwpd(ibqp->pd);
 	struct irdma_qp *iwqp = to_iwqp(ibqp);
 	struct irdma_device *iwdev = iwqp->iwdev;
@@ -1134,6 +1181,13 @@ int irdma_modify_qp_roce(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	ctx_info = &iwqp->ctx_info;
 	roce_info = &iwqp->roce_info;
 	udp_info = &iwqp->udp_info;
+
+	if (udata) {
+		/* udata inlen/outlen can be 0 when supporting legacy libi40iw */
+		if ((udata->inlen && udata->inlen < IRDMA_MODIFY_QP_MIN_REQ_LEN) ||
+		    (udata->outlen && udata->outlen < IRDMA_MODIFY_QP_MIN_RESP_LEN))
+			return -EINVAL;
+	}
 
 	if (attr_mask & ~IB_QP_ATTR_STANDARD_BITS)
 		return -EOPNOTSUPP;
@@ -1214,6 +1268,7 @@ int irdma_modify_qp_roce(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		av->attrs = attr->ah_attr;
 		rdma_gid2ip((struct sockaddr *)&av->sgid_addr, &sgid_attr->gid);
 		rdma_gid2ip((struct sockaddr *)&av->dgid_addr, &attr->ah_attr.grh.dgid);
+		av->net_type = rdma_gid_attr_network_type(sgid_attr);
 		if (av->net_type == RDMA_NETWORK_IPV6) {
 			__be32 *daddr =
 				av->dgid_addr.saddr_in6.sin6_addr.in6_u.u6_addr32;
@@ -1358,20 +1413,14 @@ int irdma_modify_qp_roce(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 
 			info.next_iwarp_state = IRDMA_QP_STATE_SQD;
 			issue_modify_qp = 1;
+			iwqp->suspend_pending = true;
 			break;
 		case IB_QPS_SQE:
 		case IB_QPS_ERR:
 		case IB_QPS_RESET:
-			if (iwqp->iwarp_state == IRDMA_QP_STATE_RTS) {
-				spin_unlock_irqrestore(&iwqp->lock, flags);
-				info.next_iwarp_state = IRDMA_QP_STATE_SQD;
-				irdma_hw_modify_qp(iwdev, iwqp, &info, true);
-				spin_lock_irqsave(&iwqp->lock, flags);
-			}
-
 			if (iwqp->iwarp_state == IRDMA_QP_STATE_ERROR) {
 				spin_unlock_irqrestore(&iwqp->lock, flags);
-				if (udata) {
+				if (udata && udata->inlen) {
 					if (ib_copy_from_udata(&ureq, udata,
 					    min(sizeof(ureq), udata->inlen)))
 						return -EINVAL;
@@ -1405,6 +1454,11 @@ int irdma_modify_qp_roce(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 			ctx_info->rem_endpoint_idx = udp_info->arp_idx;
 			if (irdma_hw_modify_qp(iwdev, iwqp, &info, true))
 				return -EINVAL;
+			if (info.next_iwarp_state == IRDMA_QP_STATE_SQD) {
+				ret = irdma_wait_for_suspend(iwqp);
+				if (ret)
+					return ret;
+			}
 			spin_lock_irqsave(&iwqp->lock, flags);
 			if (iwqp->iwarp_state == info.curr_iwarp_state) {
 				iwqp->iwarp_state = info.next_iwarp_state;
@@ -1423,7 +1477,7 @@ int irdma_modify_qp_roce(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		} else {
 			iwqp->ibqp_state = attr->qp_state;
 		}
-		if (udata && dev->hw_attrs.uk_attrs.hw_rev >= IRDMA_GEN_2) {
+		if (udata && udata->outlen && dev->hw_attrs.uk_attrs.hw_rev >= IRDMA_GEN_2) {
 			struct irdma_ucontext *ucontext;
 
 			ucontext = rdma_udata_to_drv_context(udata,
@@ -1463,6 +1517,8 @@ exit:
 int irdma_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr, int attr_mask,
 		    struct ib_udata *udata)
 {
+#define IRDMA_MODIFY_QP_MIN_REQ_LEN offsetofend(struct irdma_modify_qp_req, rq_flush)
+#define IRDMA_MODIFY_QP_MIN_RESP_LEN offsetofend(struct irdma_modify_qp_resp, push_valid)
 	struct irdma_qp *iwqp = to_iwqp(ibqp);
 	struct irdma_device *iwdev = iwqp->iwdev;
 	struct irdma_sc_dev *dev = &iwdev->rf->sc_dev;
@@ -1476,6 +1532,13 @@ int irdma_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr, int attr_mask,
 	u8 dont_wait = 0;
 	int err;
 	unsigned long flags;
+
+	if (udata) {
+		/* udata inlen/outlen can be 0 when supporting legacy libi40iw */
+		if ((udata->inlen && udata->inlen < IRDMA_MODIFY_QP_MIN_REQ_LEN) ||
+		    (udata->outlen && udata->outlen < IRDMA_MODIFY_QP_MIN_RESP_LEN))
+			return -EINVAL;
+	}
 
 	if (attr_mask & ~IB_QP_ATTR_STANDARD_BITS)
 		return -EOPNOTSUPP;
@@ -1562,7 +1625,7 @@ int irdma_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr, int attr_mask,
 		case IB_QPS_RESET:
 			if (iwqp->iwarp_state == IRDMA_QP_STATE_ERROR) {
 				spin_unlock_irqrestore(&iwqp->lock, flags);
-				if (udata) {
+				if (udata && udata->inlen) {
 					if (ib_copy_from_udata(&ureq, udata,
 					    min(sizeof(ureq), udata->inlen)))
 						return -EINVAL;
@@ -1659,7 +1722,7 @@ int irdma_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr, int attr_mask,
 			}
 		}
 	}
-	if (attr_mask & IB_QP_STATE && udata &&
+	if (attr_mask & IB_QP_STATE && udata && udata->outlen &&
 	    dev->hw_attrs.uk_attrs.hw_rev >= IRDMA_GEN_2) {
 		struct irdma_ucontext *ucontext;
 
@@ -1794,6 +1857,7 @@ static int irdma_destroy_cq(struct ib_cq *ib_cq, struct ib_udata *udata)
 static int irdma_resize_cq(struct ib_cq *ibcq, int entries,
 			   struct ib_udata *udata)
 {
+#define IRDMA_RESIZE_CQ_MIN_REQ_LEN offsetofend(struct irdma_resize_cq_req, user_cq_buffer)
 	struct irdma_cq *iwcq = to_iwcq(ibcq);
 	struct irdma_sc_dev *dev = iwcq->sc_cq.dev;
 	struct irdma_cqp_request *cqp_request;
@@ -1815,6 +1879,9 @@ static int irdma_resize_cq(struct ib_cq *ibcq, int entries,
 	if (!(rf->sc_dev.hw_attrs.uk_attrs.feature_flags &
 	    IRDMA_FEATURE_CQ_RESIZE))
 		return -EOPNOTSUPP;
+
+	if (udata && udata->inlen < IRDMA_RESIZE_CQ_MIN_REQ_LEN)
+		return -EINVAL;
 
 	if (entries > rf->max_cqe)
 		return -EINVAL;
@@ -1948,6 +2015,8 @@ static int irdma_create_cq(struct ib_cq *ibcq,
 			   const struct ib_cq_init_attr *attr,
 			   struct ib_udata *udata)
 {
+#define IRDMA_CREATE_CQ_MIN_REQ_LEN offsetofend(struct irdma_create_cq_req, user_cq_buf)
+#define IRDMA_CREATE_CQ_MIN_RESP_LEN offsetofend(struct irdma_create_cq_resp, cq_size)
 	struct ib_device *ibdev = ibcq->device;
 	struct irdma_device *iwdev = to_iwdev(ibdev);
 	struct irdma_pci_f *rf = iwdev->rf;
@@ -1966,6 +2035,11 @@ static int irdma_create_cq(struct ib_cq *ibcq,
 	err_code = cq_validate_flags(attr->flags, dev->hw_attrs.uk_attrs.hw_rev);
 	if (err_code)
 		return err_code;
+
+	if (udata && (udata->inlen < IRDMA_CREATE_CQ_MIN_REQ_LEN ||
+		      udata->outlen < IRDMA_CREATE_CQ_MIN_RESP_LEN))
+		return -EINVAL;
+
 	err_code = irdma_alloc_rsrc(rf, rf->allocated_cqs, rf->max_cq, &cq_num,
 				    &rf->next_cq);
 	if (err_code)
@@ -2084,9 +2158,8 @@ static int irdma_create_cq(struct ib_cq *ibcq,
 		info.cq_base_pa = iwcq->kmem.pa;
 	}
 
-	if (dev->hw_attrs.uk_attrs.hw_rev >= IRDMA_GEN_2)
-		info.shadow_read_threshold = min(info.cq_uk_init_info.cq_size / 2,
-						 (u32)IRDMA_MAX_CQ_READ_THRESH);
+	info.shadow_read_threshold = min(info.cq_uk_init_info.cq_size / 2,
+					 (u32)IRDMA_MAX_CQ_READ_THRESH);
 
 	if (irdma_sc_cq_init(cq, &info)) {
 		ibdev_dbg(&iwdev->ibdev, "VERBS: init cq fail\n");
@@ -2310,9 +2383,10 @@ static bool irdma_check_mr_contiguous(struct irdma_pble_alloc *palloc,
  * @rf: RDMA PCI function
  * @iwmr: mr pointer for this memory registration
  * @use_pbles: flag if to use pble's
+ * @lvl_1_only: request only level 1 pble if true
  */
 static int irdma_setup_pbles(struct irdma_pci_f *rf, struct irdma_mr *iwmr,
-			     bool use_pbles)
+			     bool use_pbles, bool lvl_1_only)
 {
 	struct irdma_pbl *iwpbl = &iwmr->iwpbl;
 	struct irdma_pble_alloc *palloc = &iwpbl->pble_alloc;
@@ -2323,7 +2397,7 @@ static int irdma_setup_pbles(struct irdma_pci_f *rf, struct irdma_mr *iwmr,
 
 	if (use_pbles) {
 		status = irdma_get_pble(rf->pble_rsrc, palloc, iwmr->page_cnt,
-					false);
+					lvl_1_only);
 		if (status)
 			return status;
 
@@ -2366,15 +2440,9 @@ static int irdma_handle_q_mem(struct irdma_device *iwdev,
 	bool ret = true;
 
 	pg_size = iwmr->page_size;
-	err = irdma_setup_pbles(iwdev->rf, iwmr, use_pbles);
+	err = irdma_setup_pbles(iwdev->rf, iwmr, use_pbles, true);
 	if (err)
 		return err;
-
-	if (use_pbles && palloc->level != PBLE_LEVEL_1) {
-		irdma_free_pble(iwdev->rf->pble_rsrc, palloc);
-		iwpbl->pbl_allocated = false;
-		return -ENOMEM;
-	}
 
 	if (use_pbles)
 		arr = palloc->level1.addr;
@@ -2541,7 +2609,8 @@ static int irdma_hw_alloc_stag(struct irdma_device *iwdev,
 			       struct irdma_mr *iwmr)
 {
 	struct irdma_allocate_stag_info *info;
-	struct irdma_pd *iwpd = to_iwpd(iwmr->ibmr.pd);
+	struct ib_pd *pd = iwmr->ibmr.pd;
+	struct irdma_pd *iwpd = to_iwpd(pd);
 	int status;
 	struct irdma_cqp_request *cqp_request;
 	struct cqp_cmds_info *cqp_info;
@@ -2557,6 +2626,7 @@ static int irdma_hw_alloc_stag(struct irdma_device *iwdev,
 	info->stag_idx = iwmr->stag >> IRDMA_CQPSQ_STAG_IDX_S;
 	info->pd_id = iwpd->sc_pd.pd_id;
 	info->total_len = iwmr->len;
+	info->all_memory = pd->flags & IB_PD_UNSAFE_GLOBAL_RKEY;
 	info->remote_access = true;
 	cqp_info->cqp_cmd = IRDMA_OP_ALLOC_STAG;
 	cqp_info->post_sq = 1;
@@ -2604,6 +2674,8 @@ static struct ib_mr *irdma_alloc_mr(struct ib_pd *pd, enum ib_mr_type mr_type,
 	iwmr->type = IRDMA_MEMREG_TYPE_MEM;
 	palloc = &iwpbl->pble_alloc;
 	iwmr->page_cnt = max_num_sg;
+	/* Use system PAGE_SIZE as the sg page sizes are unknown at this point */
+	iwmr->len = max_num_sg * PAGE_SIZE;
 	err_code = irdma_get_pble(iwdev->rf->pble_rsrc, palloc, iwmr->page_cnt,
 				  false);
 	if (err_code)
@@ -2683,7 +2755,8 @@ static int irdma_hwreg_mr(struct irdma_device *iwdev, struct irdma_mr *iwmr,
 {
 	struct irdma_pbl *iwpbl = &iwmr->iwpbl;
 	struct irdma_reg_ns_stag_info *stag_info;
-	struct irdma_pd *iwpd = to_iwpd(iwmr->ibmr.pd);
+	struct ib_pd *pd = iwmr->ibmr.pd;
+	struct irdma_pd *iwpd = to_iwpd(pd);
 	struct irdma_pble_alloc *palloc = &iwpbl->pble_alloc;
 	struct irdma_cqp_request *cqp_request;
 	struct cqp_cmds_info *cqp_info;
@@ -2702,6 +2775,7 @@ static int irdma_hwreg_mr(struct irdma_device *iwdev, struct irdma_mr *iwmr,
 	stag_info->total_len = iwmr->len;
 	stag_info->access_rights = irdma_get_mr_access(access);
 	stag_info->pd_id = iwpd->sc_pd.pd_id;
+	stag_info->all_memory = pd->flags & IB_PD_UNSAFE_GLOBAL_RKEY;
 	if (stag_info->access_rights & IRDMA_ACCESS_FLAGS_ZERO_BASED)
 		stag_info->addr_type = IRDMA_ADDR_TYPE_ZERO_BASED;
 	else
@@ -2743,6 +2817,7 @@ static struct ib_mr *irdma_reg_user_mr(struct ib_pd *pd, u64 start, u64 len,
 				       u64 virt, int access,
 				       struct ib_udata *udata)
 {
+#define IRDMA_MEM_REG_MIN_REQ_LEN offsetofend(struct irdma_mem_reg_req, sq_pages)
 	struct irdma_device *iwdev = to_iwdev(pd->device);
 	struct irdma_ucontext *ucontext;
 	struct irdma_pble_alloc *palloc;
@@ -2758,6 +2833,9 @@ static struct ib_mr *irdma_reg_user_mr(struct ib_pd *pd, u64 start, u64 len,
 	int ret;
 
 	if (len > iwdev->rf->sc_dev.hw_attrs.max_mr_size)
+		return ERR_PTR(-EINVAL);
+
+	if (udata->inlen < IRDMA_MEM_REG_MIN_REQ_LEN)
 		return ERR_PTR(-EINVAL);
 
 	region = ib_umem_get(pd->device, start, len, access);
@@ -2785,7 +2863,7 @@ static struct ib_mr *irdma_reg_user_mr(struct ib_pd *pd, u64 start, u64 len,
 	iwmr->ibmr.pd = pd;
 	iwmr->ibmr.device = pd->device;
 	iwmr->ibmr.iova = virt;
-	iwmr->page_size = PAGE_SIZE;
+	iwmr->page_size = SZ_4K;
 
 	if (req.reg_type == IRDMA_MEMREG_TYPE_MEM) {
 		iwmr->page_size = ib_umem_find_best_pgsz(region,
@@ -2805,6 +2883,13 @@ static struct ib_mr *irdma_reg_user_mr(struct ib_pd *pd, u64 start, u64 len,
 
 	switch (req.reg_type) {
 	case IRDMA_MEMREG_TYPE_QP:
+		/* iWarp: Catch page not starting on OS page boundary */
+		if (!rdma_protocol_roce(&iwdev->ibdev, 1) &&
+		    ib_umem_offset(iwmr->region)) {
+			err = -EINVAL;
+			goto error;
+		}
+
 		total = req.sq_pages + req.rq_pages + shadow_pgcnt;
 		if (total > iwmr->page_cnt) {
 			err = -EINVAL;
@@ -2847,7 +2932,7 @@ static struct ib_mr *irdma_reg_user_mr(struct ib_pd *pd, u64 start, u64 len,
 	case IRDMA_MEMREG_TYPE_MEM:
 		use_pbles = (iwmr->page_cnt != 1);
 
-		err = irdma_setup_pbles(iwdev->rf, iwmr, use_pbles);
+		err = irdma_setup_pbles(iwdev->rf, iwmr, use_pbles, false);
 		if (err)
 			goto error;
 
@@ -3009,6 +3094,7 @@ static int irdma_dereg_mr(struct ib_mr *ib_mr, struct ib_udata *udata)
 	struct irdma_pble_alloc *palloc = &iwpbl->pble_alloc;
 	struct irdma_cqp_request *cqp_request;
 	struct cqp_cmds_info *cqp_info;
+	int status;
 
 	if (iwmr->type != IRDMA_MEMREG_TYPE_MEM) {
 		if (iwmr->region) {
@@ -3039,8 +3125,11 @@ static int irdma_dereg_mr(struct ib_mr *ib_mr, struct ib_udata *udata)
 	cqp_info->post_sq = 1;
 	cqp_info->in.u.dealloc_stag.dev = &iwdev->rf->sc_dev;
 	cqp_info->in.u.dealloc_stag.scratch = (uintptr_t)cqp_request;
-	irdma_handle_cqp_op(iwdev->rf, cqp_request);
+	status = irdma_handle_cqp_op(iwdev->rf, cqp_request);
 	irdma_put_cqp_request(&iwdev->rf->cqp, cqp_request);
+	if (status)
+		return status;
+
 	irdma_free_stag(iwdev, iwmr->stag);
 done:
 	if (iwpbl->pbl_allocated)
@@ -3109,30 +3198,20 @@ static int irdma_post_send(struct ib_qp *ibqp,
 				info.stag_to_inv = ib_wr->ex.invalidate_rkey;
 			}
 
-			if (ib_wr->send_flags & IB_SEND_INLINE) {
-				info.op.inline_send.data = (void *)(unsigned long)
-							   ib_wr->sg_list[0].addr;
-				info.op.inline_send.len = ib_wr->sg_list[0].length;
-				if (iwqp->ibqp.qp_type == IB_QPT_UD ||
-				    iwqp->ibqp.qp_type == IB_QPT_GSI) {
-					ah = to_iwah(ud_wr(ib_wr)->ah);
-					info.op.inline_send.ah_id = ah->sc_ah.ah_info.ah_idx;
-					info.op.inline_send.qkey = ud_wr(ib_wr)->remote_qkey;
-					info.op.inline_send.dest_qp = ud_wr(ib_wr)->remote_qpn;
-				}
-				err = irdma_uk_inline_send(ukqp, &info, false);
-			} else {
-				info.op.send.num_sges = ib_wr->num_sge;
-				info.op.send.sg_list = ib_wr->sg_list;
-				if (iwqp->ibqp.qp_type == IB_QPT_UD ||
-				    iwqp->ibqp.qp_type == IB_QPT_GSI) {
-					ah = to_iwah(ud_wr(ib_wr)->ah);
-					info.op.send.ah_id = ah->sc_ah.ah_info.ah_idx;
-					info.op.send.qkey = ud_wr(ib_wr)->remote_qkey;
-					info.op.send.dest_qp = ud_wr(ib_wr)->remote_qpn;
-				}
-				err = irdma_uk_send(ukqp, &info, false);
+			info.op.send.num_sges = ib_wr->num_sge;
+			info.op.send.sg_list = ib_wr->sg_list;
+			if (iwqp->ibqp.qp_type == IB_QPT_UD ||
+			    iwqp->ibqp.qp_type == IB_QPT_GSI) {
+				ah = to_iwah(ud_wr(ib_wr)->ah);
+				info.op.send.ah_id = ah->sc_ah.ah_info.ah_idx;
+				info.op.send.qkey = ud_wr(ib_wr)->remote_qkey;
+				info.op.send.dest_qp = ud_wr(ib_wr)->remote_qpn;
 			}
+
+			if (ib_wr->send_flags & IB_SEND_INLINE)
+				err = irdma_uk_inline_send(ukqp, &info, false);
+			else
+				err = irdma_uk_send(ukqp, &info, false);
 			break;
 		case IB_WR_RDMA_WRITE_WITH_IMM:
 			if (ukqp->qp_caps & IRDMA_WRITE_WITH_IMM) {
@@ -3149,22 +3228,15 @@ static int irdma_post_send(struct ib_qp *ibqp,
 			else
 				info.op_type = IRDMA_OP_TYPE_RDMA_WRITE;
 
-			if (ib_wr->send_flags & IB_SEND_INLINE) {
-				info.op.inline_rdma_write.data = (void *)(uintptr_t)ib_wr->sg_list[0].addr;
-				info.op.inline_rdma_write.len =
-						ib_wr->sg_list[0].length;
-				info.op.inline_rdma_write.rem_addr.addr =
-						rdma_wr(ib_wr)->remote_addr;
-				info.op.inline_rdma_write.rem_addr.lkey =
-						rdma_wr(ib_wr)->rkey;
+			info.op.rdma_write.num_lo_sges = ib_wr->num_sge;
+			info.op.rdma_write.lo_sg_list = ib_wr->sg_list;
+			info.op.rdma_write.rem_addr.addr =
+				rdma_wr(ib_wr)->remote_addr;
+			info.op.rdma_write.rem_addr.lkey = rdma_wr(ib_wr)->rkey;
+			if (ib_wr->send_flags & IB_SEND_INLINE)
 				err = irdma_uk_inline_rdma_write(ukqp, &info, false);
-			} else {
-				info.op.rdma_write.lo_sg_list = (void *)ib_wr->sg_list;
-				info.op.rdma_write.num_lo_sges = ib_wr->num_sge;
-				info.op.rdma_write.rem_addr.addr = rdma_wr(ib_wr)->remote_addr;
-				info.op.rdma_write.rem_addr.lkey = rdma_wr(ib_wr)->rkey;
+			else
 				err = irdma_uk_rdma_write(ukqp, &info, false);
-			}
 			break;
 		case IB_WR_RDMA_READ_WITH_INV:
 			inv_stag = true;
@@ -3184,6 +3256,7 @@ static int irdma_post_send(struct ib_qp *ibqp,
 			break;
 		case IB_WR_LOCAL_INV:
 			info.op_type = IRDMA_OP_TYPE_INV_STAG;
+			info.local_fence = info.read_fence;
 			info.op.inv_local_stag.target_stag = ib_wr->ex.invalidate_rkey;
 			err = irdma_uk_stag_local_invalidate(ukqp, &info, true);
 			break;
@@ -3308,6 +3381,8 @@ static enum ib_wc_status irdma_flush_err_to_ib_wc_status(enum irdma_flush_opcode
 		return IB_WC_RETRY_EXC_ERR;
 	case FLUSH_MW_BIND_ERR:
 		return IB_WC_MW_BIND_ERR;
+	case FLUSH_REM_INV_REQ_ERR:
+		return IB_WC_REM_INV_REQ_ERR;
 	case FLUSH_FATAL_ERR:
 	default:
 		return IB_WC_FATAL_ERR;
@@ -3322,7 +3397,6 @@ static enum ib_wc_status irdma_flush_err_to_ib_wc_status(enum irdma_flush_opcode
 static void irdma_process_cqe(struct ib_wc *entry,
 			      struct irdma_cq_poll_info *cq_poll_info)
 {
-	struct irdma_qp *iwqp;
 	struct irdma_sc_qp *qp;
 
 	entry->wc_flags = 0;
@@ -3330,7 +3404,6 @@ static void irdma_process_cqe(struct ib_wc *entry,
 	entry->wr_id = cq_poll_info->wr_id;
 
 	qp = cq_poll_info->qp_handle;
-	iwqp = qp->qp_uk.back_qp;
 	entry->qp = qp->qp_uk.back_qp;
 
 	if (cq_poll_info->error) {
@@ -3363,42 +3436,17 @@ static void irdma_process_cqe(struct ib_wc *entry,
 		}
 	}
 
-	switch (cq_poll_info->op_type) {
-	case IRDMA_OP_TYPE_RDMA_WRITE:
-	case IRDMA_OP_TYPE_RDMA_WRITE_SOL:
-		entry->opcode = IB_WC_RDMA_WRITE;
-		break;
-	case IRDMA_OP_TYPE_RDMA_READ_INV_STAG:
-	case IRDMA_OP_TYPE_RDMA_READ:
-		entry->opcode = IB_WC_RDMA_READ;
-		break;
-	case IRDMA_OP_TYPE_SEND_INV:
-	case IRDMA_OP_TYPE_SEND_SOL:
-	case IRDMA_OP_TYPE_SEND_SOL_INV:
-	case IRDMA_OP_TYPE_SEND:
-		entry->opcode = IB_WC_SEND;
-		break;
-	case IRDMA_OP_TYPE_FAST_REG_NSMR:
-		entry->opcode = IB_WC_REG_MR;
-		break;
-	case IRDMA_OP_TYPE_INV_STAG:
-		entry->opcode = IB_WC_LOCAL_INV;
-		break;
-	case IRDMA_OP_TYPE_REC_IMM:
-	case IRDMA_OP_TYPE_REC:
-		entry->opcode = cq_poll_info->op_type == IRDMA_OP_TYPE_REC_IMM ?
-			IB_WC_RECV_RDMA_WITH_IMM : IB_WC_RECV;
+	if (cq_poll_info->q_type == IRDMA_CQE_QTYPE_SQ) {
+		set_ib_wc_op_sq(cq_poll_info, entry);
+	} else {
+		set_ib_wc_op_rq(cq_poll_info, entry,
+				qp->qp_uk.qp_caps & IRDMA_SEND_WITH_IMM ?
+				true : false);
 		if (qp->qp_uk.qp_type != IRDMA_QP_TYPE_ROCE_UD &&
 		    cq_poll_info->stag_invalid_set) {
 			entry->ex.invalidate_rkey = cq_poll_info->inv_stag;
 			entry->wc_flags |= IB_WC_WITH_INVALIDATE;
 		}
-		break;
-	default:
-		ibdev_err(&iwqp->iwdev->ibdev,
-			  "Invalid opcode = %d in CQE\n", cq_poll_info->op_type);
-		entry->status = IB_WC_GENERAL_ERR;
-		return;
 	}
 
 	if (qp->qp_uk.qp_type == IRDMA_QP_TYPE_ROCE_UD) {
@@ -4289,11 +4337,15 @@ static int irdma_create_user_ah(struct ib_ah *ibah,
 				struct rdma_ah_init_attr *attr,
 				struct ib_udata *udata)
 {
+#define IRDMA_CREATE_AH_MIN_RESP_LEN offsetofend(struct irdma_create_ah_resp, rsvd)
 	struct irdma_ah *ah = container_of(ibah, struct irdma_ah, ibah);
 	struct irdma_device *iwdev = to_iwdev(ibah->pd->device);
 	struct irdma_create_ah_resp uresp;
 	struct irdma_ah *parent_ah;
 	int err;
+
+	if (udata && udata->outlen < IRDMA_CREATE_AH_MIN_RESP_LEN)
+		return -EINVAL;
 
 	err = irdma_setup_ah(ibah, attr);
 	if (err)
@@ -4366,7 +4418,6 @@ static int irdma_query_ah(struct ib_ah *ibah, struct rdma_ah_attr *ah_attr)
 		ah_attr->grh.flow_label = ah->sc_ah.ah_info.flow_label;
 		ah_attr->grh.traffic_class = ah->sc_ah.ah_info.tc_tos;
 		ah_attr->grh.hop_limit = ah->sc_ah.ah_info.hop_ttl;
-		ah_attr->grh.sgid_index = ah->sgid_index;
 		ah_attr->grh.sgid_index = ah->sgid_index;
 		memcpy(&ah_attr->grh.dgid, &ah->dgid,
 		       sizeof(ah_attr->grh.dgid));

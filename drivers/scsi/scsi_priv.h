@@ -19,6 +19,17 @@ struct scsi_nl_hdr;
 #define SCSI_CMD_RETRIES_NO_LIMIT -1
 
 /*
+ * Error codes used by scsi-ml internally. These must not be used by drivers.
+ */
+enum scsi_ml_status {
+	SCSIML_STAT_OK			= 0x00,
+	SCSIML_STAT_RESV_CONFLICT	= 0x01,	/* Reservation conflict */
+	SCSIML_STAT_NOSPC		= 0x02,	/* Space allocation on the dev failed */
+	SCSIML_STAT_MED_ERROR		= 0x03,	/* Medium error */
+	SCSIML_STAT_TGT_FAILURE		= 0x04,	/* Permanent target failure */
+};
+
+/*
  * Scsi Error Handler Flags
  */
 #define SCSI_EH_ABORT_SCHEDULED	0x0002	/* Abort has been scheduled */
@@ -75,7 +86,7 @@ extern void scmd_eh_abort_handler(struct work_struct *work);
 extern enum blk_eh_timer_return scsi_timeout(struct request *req);
 extern int scsi_error_handler(void *host);
 extern enum scsi_disposition scsi_decide_disposition(struct scsi_cmnd *cmd);
-extern void scsi_eh_wakeup(struct Scsi_Host *shost);
+extern void scsi_eh_wakeup(struct Scsi_Host *shost, unsigned int busy);
 extern void scsi_eh_scmd_add(struct scsi_cmnd *);
 void scsi_eh_ready_devs(struct Scsi_Host *shost,
 			struct list_head *work_q,
@@ -94,7 +105,7 @@ extern void scsi_run_host_queues(struct Scsi_Host *shost);
 extern void scsi_requeue_run_queue(struct work_struct *work);
 extern void scsi_start_queue(struct scsi_device *sdev);
 extern int scsi_mq_setup_tags(struct Scsi_Host *shost);
-extern void scsi_mq_destroy_tags(struct Scsi_Host *shost);
+extern void scsi_mq_free_tags(struct kref *kref);
 extern void scsi_exit_queue(void);
 extern void scsi_evt_thread(struct work_struct *work);
 
@@ -121,7 +132,6 @@ extern int scsi_complete_async_scans(void);
 extern int scsi_scan_host_selected(struct Scsi_Host *, unsigned int,
 				   unsigned int, u64, enum scsi_scan_mode);
 extern void scsi_forget_host(struct Scsi_Host *);
-extern void scsi_rescan_device(struct device *);
 
 /* scsi_sysctl.c */
 #ifdef CONFIG_SYSCTL

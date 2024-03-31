@@ -34,6 +34,7 @@
 #include <linux/percpu.h>
 #include <linux/kmod.h>
 #include <linux/kprobes.h>
+#include <linux/kmsan.h>
 #include <linux/vmalloc.h>
 #include <linux/kernel_stat.h>
 #include <linux/start_kernel.h>
@@ -88,6 +89,7 @@
 #include <linux/sched/task_stack.h>
 #include <linux/context_tracking.h>
 #include <linux/random.h>
+#include <linux/moduleloader.h>
 #include <linux/list.h>
 #include <linux/integrity.h>
 #include <linux/proc_ns.h>
@@ -95,7 +97,6 @@
 #include <linux/cache.h>
 #include <linux/rodata_test.h>
 #include <linux/jump_label.h>
-#include <linux/mem_encrypt.h>
 #include <linux/kcsan.h>
 #include <linux/init_syscalls.h>
 #include <linux/stackdepot.h>
@@ -103,7 +104,6 @@
 #include <net/net_namespace.h>
 
 #include <asm/io.h>
-#include <asm/bugs.h>
 #include <asm/setup.h>
 #include <asm/sections.h>
 #include <asm/cacheflush.h>
@@ -117,6 +117,7 @@ static int kernel_init(void *);
 
 extern void init_IRQ(void);
 extern void radix_tree_init(void);
+extern void maple_tree_init(void);
 
 /*
  * Debug helper: via this flag we know that we are in 'early bootup code'
@@ -422,7 +423,7 @@ static void __init setup_boot_config(void)
 	if (!data)
 		data = xbc_get_embedded_bootconfig(&size);
 
-	strlcpy(tmp_cmdline, boot_command_line, COMMAND_LINE_SIZE);
+	strscpy(tmp_cmdline, boot_command_line, COMMAND_LINE_SIZE);
 	err = parse_args("bootconfig", tmp_cmdline, NULL, 0, 0, 0, NULL,
 			 bootconfig_params);
 
@@ -532,6 +533,10 @@ static int __init unknown_bootoption(char *param, char *val,
 				     const char *unused, void *arg)
 {
 	size_t len = strlen(param);
+
+	/* Handle params aliased to sysctls */
+	if (sysctl_is_alias(param))
+		return 0;
 
 	repair_env_string(param, val);
 
@@ -762,7 +767,7 @@ void __init parse_early_param(void)
 		return;
 
 	/* All fall through to do_early_param. */
-	strlcpy(tmp_cmdline, boot_command_line, COMMAND_LINE_SIZE);
+	strscpy(tmp_cmdline, boot_command_line, COMMAND_LINE_SIZE);
 	parse_early_options(tmp_cmdline);
 	done = 1;
 }
@@ -778,8 +783,6 @@ void __init __weak thread_stack_cache_init(void)
 {
 }
 #endif
-
-void __init __weak mem_encrypt_init(void) { }
 
 void __init __weak poking_init(void) { }
 
@@ -836,6 +839,7 @@ static void __init mm_init(void)
 	init_mem_debugging_and_hardening();
 	kfence_alloc_pool();
 	report_meminit();
+	kmsan_init_shadow();
 	stack_depot_early_init();
 	mem_init();
 	mem_init_print_info();
@@ -849,10 +853,15 @@ static void __init mm_init(void)
 	pgtable_init();
 	debug_objects_mem_init();
 	vmalloc_init();
+	/* Should be run after vmap initialization */
+	if (early_page_ext_enabled())
+		page_ext_init();
 	/* Should be run before the first non-init thread is created */
 	init_espfix_bsp();
 	/* Should be run after espfix64 is set up. */
 	pti_init();
+	kmsan_init_runtime();
+	mm_cache_init();
 }
 
 #ifdef CONFIG_RANDOMIZE_KSTACK_OFFSET
@@ -976,6 +985,9 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 		parse_args("Setting extra init args", extra_init_args,
 			   NULL, 0, -1, -1, NULL, set_init_arg);
 
+	/* Architectural and non-timekeeping rng init, before allocator init */
+	random_init_early(command_line);
+
 	/*
 	 * These use large bootmem allocations and must precede
 	 * kmem_cache_init()
@@ -985,7 +997,7 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 	sort_main_extable();
 	trap_init();
 	mm_init();
-
+	poking_init();
 	ftrace_init();
 
 	/* trace_printk can be enabled here */
@@ -1002,6 +1014,7 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 		 "Interrupts were enabled *very* early, fixing it\n"))
 		local_irq_disable();
 	radix_tree_init();
+	maple_tree_init();
 
 	/*
 	 * Set up housekeeping before setting up workqueues to allow the unbound
@@ -1035,17 +1048,13 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 	hrtimers_init();
 	softirq_init();
 	timekeeping_init();
-	kfence_init();
 	time_init();
 
-	/*
-	 * For best initial stack canary entropy, prepare it after:
-	 * - setup_arch() for any UEFI RNG entropy and boot cmdline access
-	 * - timekeeping_init() for ktime entropy used in random_init()
-	 * - time_init() for making random_get_entropy() work on some platforms
-	 * - random_init() to initialize the RNG from from early entropy sources
-	 */
-	random_init(command_line);
+	/* This must be after timekeeping is initialized */
+	random_init();
+
+	/* These make use of the fully initialized rng */
+	kfence_init();
 	boot_init_stack_canary();
 
 	perf_event_init();
@@ -1077,14 +1086,6 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 	 */
 	locking_selftest();
 
-	/*
-	 * This needs to be called before any devices perform DMA
-	 * operations that might use the SWIOTLB bounce buffers. It will
-	 * mark the bounce buffers as decrypted so that their usage will
-	 * not cause "plain-text" data to be decrypted when accessed.
-	 */
-	mem_encrypt_init();
-
 #ifdef CONFIG_BLK_DEV_INITRD
 	if (initrd_start && !initrd_below_start_ok &&
 	    page_to_pfn(virt_to_page((void *)initrd_start)) < min_low_pfn) {
@@ -1101,6 +1102,9 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 		late_time_init();
 	sched_clock_init();
 	calibrate_delay();
+
+	arch_cpu_finalize_init();
+
 	pid_idr_init();
 	anon_vma_init();
 #ifdef CONFIG_X86
@@ -1126,9 +1130,6 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 	cgroup_init();
 	taskstats_init_early();
 	delayacct_init();
-
-	poking_init();
-	check_bugs();
 
 	acpi_subsystem_init();
 	arch_post_acpi_subsys_init();
@@ -1237,7 +1238,7 @@ __setup("initcall_blacklist=", initcall_blacklist);
 static __init_or_module void
 trace_initcall_start_cb(void *data, initcall_t fn)
 {
-	ktime_t *calltime = (ktime_t *)data;
+	ktime_t *calltime = data;
 
 	printk(KERN_DEBUG "calling  %pS @ %i\n", fn, task_pid_nr(current));
 	*calltime = ktime_get();
@@ -1246,7 +1247,7 @@ trace_initcall_start_cb(void *data, initcall_t fn)
 static __init_or_module void
 trace_initcall_finish_cb(void *data, initcall_t fn, int ret)
 {
-	ktime_t rettime, *calltime = (ktime_t *)data;
+	ktime_t rettime, *calltime = data;
 
 	rettime = ktime_get();
 	printk(KERN_DEBUG "initcall %pS returned %d after %lld usecs\n",
@@ -1446,13 +1447,25 @@ static noinline void __init kernel_init_freeable(void);
 
 #if defined(CONFIG_STRICT_KERNEL_RWX) || defined(CONFIG_STRICT_MODULE_RWX)
 bool rodata_enabled __ro_after_init = true;
+
+#ifndef arch_parse_debug_rodata
+static inline bool arch_parse_debug_rodata(char *str) { return false; }
+#endif
+
 static int __init set_debug_rodata(char *str)
 {
-	if (strtobool(str, &rodata_enabled))
+	if (arch_parse_debug_rodata(str))
+		return 0;
+
+	if (str && !strcmp(str, "on"))
+		rodata_enabled = true;
+	else if (str && !strcmp(str, "off"))
+		rodata_enabled = false;
+	else
 		pr_warn("Invalid option string for rodata: '%s'\n", str);
-	return 1;
+	return 0;
 }
-__setup("rodata=", set_debug_rodata);
+early_param("rodata", set_debug_rodata);
 #endif
 
 #ifdef CONFIG_STRICT_KERNEL_RWX
@@ -1461,11 +1474,11 @@ static void mark_readonly(void)
 	if (rodata_enabled) {
 		/*
 		 * load_module() results in W+X mappings, which are cleaned
-		 * up with call_rcu().  Let's make sure that queued work is
+		 * up with init_free_wq. Let's make sure that queued work is
 		 * flushed so that we don't hit false positives looking for
 		 * insecure pages which are W+X.
 		 */
-		rcu_barrier();
+		flush_module_init_free_work();
 		mark_rodata_ro();
 		rodata_test();
 	} else
@@ -1606,7 +1619,8 @@ static noinline void __init kernel_init_freeable(void)
 	padata_init();
 	page_alloc_init_late();
 	/* Initialize page ext after all struct pages are initialized. */
-	page_ext_init();
+	if (!early_page_ext_enabled())
+		page_ext_init();
 
 	do_basic_setup();
 

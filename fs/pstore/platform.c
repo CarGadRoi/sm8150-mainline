@@ -28,13 +28,10 @@
 #include <linux/crypto.h>
 #include <linux/string.h>
 #include <linux/timer.h>
-#include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
-
-#include <crypto/acompress.h>
 
 #include "internal.h"
 
@@ -93,8 +90,7 @@ module_param(compress, charp, 0444);
 MODULE_PARM_DESC(compress, "compression to use");
 
 /* Compression parameters */
-static struct crypto_acomp *tfm;
-static struct acomp_req *creq;
+static struct crypto_comp *tfm;
 
 struct pstore_zbackend {
 	int (*zbufsize)(size_t size);
@@ -272,21 +268,12 @@ static const struct pstore_zbackend zbackends[] = {
 static int pstore_compress(const void *in, void *out,
 			   unsigned int inlen, unsigned int outlen)
 {
-	struct scatterlist src, dst;
 	int ret;
 
 	if (!IS_ENABLED(CONFIG_PSTORE_COMPRESS))
 		return -EINVAL;
 
-	sg_init_table(&src, 1);
-	sg_set_buf(&src, in, inlen);
-
-	sg_init_table(&dst, 1);
-	sg_set_buf(&dst, out, outlen);
-
-	acomp_request_set_params(creq, &src, &dst, inlen, outlen);
-
-	ret = crypto_acomp_compress(creq);
+	ret = crypto_comp_compress(tfm, in, inlen, out, &outlen);
 	if (ret) {
 		pr_err("crypto_comp_compress failed, ret = %d!\n", ret);
 		return ret;
@@ -297,7 +284,7 @@ static int pstore_compress(const void *in, void *out,
 
 static void allocate_buf_for_compression(void)
 {
-	struct crypto_acomp *acomp;
+	struct crypto_comp *ctx;
 	int size;
 	char *buf;
 
@@ -309,7 +296,7 @@ static void allocate_buf_for_compression(void)
 	if (!psinfo || tfm)
 		return;
 
-	if (!crypto_has_acomp(zbackend->name, 0, CRYPTO_ALG_ASYNC)) {
+	if (!crypto_has_comp(zbackend->name, 0, 0)) {
 		pr_err("Unknown compression: %s\n", zbackend->name);
 		return;
 	}
@@ -328,24 +315,16 @@ static void allocate_buf_for_compression(void)
 		return;
 	}
 
-	acomp = crypto_alloc_acomp(zbackend->name, 0, CRYPTO_ALG_ASYNC);
-	if (IS_ERR_OR_NULL(acomp)) {
+	ctx = crypto_alloc_comp(zbackend->name, 0, 0);
+	if (IS_ERR_OR_NULL(ctx)) {
 		kfree(buf);
 		pr_err("crypto_alloc_comp('%s') failed: %ld\n", zbackend->name,
-		       PTR_ERR(acomp));
-		return;
-	}
-
-	creq = acomp_request_alloc(acomp);
-	if (!creq) {
-		crypto_free_acomp(acomp);
-		kfree(buf);
-		pr_err("acomp_request_alloc('%s') failed\n", zbackend->name);
+		       PTR_ERR(ctx));
 		return;
 	}
 
 	/* A non-NULL big_oops_buf indicates compression is available. */
-	tfm = acomp;
+	tfm = ctx;
 	big_oops_buf_sz = size;
 	big_oops_buf = buf;
 
@@ -355,8 +334,7 @@ static void allocate_buf_for_compression(void)
 static void free_buf_for_compression(void)
 {
 	if (IS_ENABLED(CONFIG_PSTORE_COMPRESS) && tfm) {
-		acomp_request_free(creq);
-		crypto_free_acomp(tfm);
+		crypto_free_comp(tfm);
 		tfm = NULL;
 	}
 	kfree(big_oops_buf);
@@ -583,6 +561,8 @@ out:
  */
 int pstore_register(struct pstore_info *psi)
 {
+	char *new_backend;
+
 	if (backend && strcmp(backend, psi->name)) {
 		pr_warn("ignoring unexpected backend '%s'\n", psi->name);
 		return -EPERM;
@@ -602,11 +582,16 @@ int pstore_register(struct pstore_info *psi)
 		return -EINVAL;
 	}
 
+	new_backend = kstrdup(psi->name, GFP_KERNEL);
+	if (!new_backend)
+		return -ENOMEM;
+
 	mutex_lock(&psinfo_lock);
 	if (psinfo) {
 		pr_warn("backend '%s' already loaded: ignoring '%s'\n",
 			psinfo->name, psi->name);
 		mutex_unlock(&psinfo_lock);
+		kfree(new_backend);
 		return -EBUSY;
 	}
 
@@ -639,7 +624,7 @@ int pstore_register(struct pstore_info *psi)
 	 * Update the module parameter backend, so it is visible
 	 * through /sys/module/pstore/parameters/backend
 	 */
-	backend = kstrdup(psi->name, GFP_KERNEL);
+	backend = new_backend;
 
 	pr_info("Registered %s as persistent store backend\n", psi->name);
 
@@ -693,8 +678,6 @@ static void decompress_record(struct pstore_record *record)
 	int ret;
 	int unzipped_len;
 	char *unzipped, *workspace;
-	struct acomp_req *dreq;
-	struct scatterlist src, dst;
 
 	if (!IS_ENABLED(CONFIG_PSTORE_COMPRESS) || !record->compressed)
 		return;
@@ -718,30 +701,16 @@ static void decompress_record(struct pstore_record *record)
 	if (!workspace)
 		return;
 
-	dreq = acomp_request_alloc(tfm);
-	if (!dreq) {
-		kfree(workspace);
-		return;
-	}
-
-	sg_init_table(&src, 1);
-	sg_set_buf(&src, record->buf, record->size);
-
-	sg_init_table(&dst, 1);
-	sg_set_buf(&dst, workspace, unzipped_len);
-
-	acomp_request_set_params(dreq, &src, &dst, record->size, unzipped_len);
-
 	/* After decompression "unzipped_len" is almost certainly smaller. */
-	ret = crypto_acomp_decompress(dreq);
+	ret = crypto_comp_decompress(tfm, record->buf, record->size,
+					  workspace, &unzipped_len);
 	if (ret) {
-		pr_err("crypto_acomp_decompress failed, ret = %d!\n", ret);
+		pr_err("crypto_comp_decompress failed, ret = %d!\n", ret);
 		kfree(workspace);
 		return;
 	}
 
 	/* Append ECC notice to decompressed buffer. */
-	unzipped_len = dreq->dlen;
 	memcpy(workspace + unzipped_len, record->buf + record->size,
 	       record->ecc_notice_size);
 
@@ -749,7 +718,6 @@ static void decompress_record(struct pstore_record *record)
 	unzipped = kmemdup(workspace, unzipped_len + record->ecc_notice_size,
 			   GFP_KERNEL);
 	kfree(workspace);
-	acomp_request_free(dreq);
 	if (!unzipped)
 		return;
 

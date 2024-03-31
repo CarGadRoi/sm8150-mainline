@@ -109,6 +109,13 @@ static __inline__ struct ipv6_pinfo *inet6_sk_generic(struct sock *sk)
 	return (struct ipv6_pinfo *)(((u8 *)sk) + offset);
 }
 
+void inet6_sock_destruct(struct sock *sk)
+{
+	inet6_cleanup_sock(sk);
+	inet_sock_destruct(sk);
+}
+EXPORT_SYMBOL_GPL(inet6_sock_destruct);
+
 static int inet6_create(struct net *net, struct socket *sock, int protocol,
 			int kern)
 {
@@ -192,6 +199,9 @@ lookup_protocol:
 	if (INET_PROTOSW_REUSE & answer_flags)
 		sk->sk_reuse = SK_CAN_REUSE;
 
+	if (INET_PROTOSW_ICSK & answer_flags)
+		inet_init_csk_locks(sk);
+
 	inet = inet_sk(sk);
 	inet->is_icsk = (INET_PROTOSW_ICSK & answer_flags) != 0;
 
@@ -201,7 +211,7 @@ lookup_protocol:
 			inet->hdrincl = 1;
 	}
 
-	sk->sk_destruct		= inet_sock_destruct;
+	sk->sk_destruct		= inet6_sock_destruct;
 	sk->sk_family		= PF_INET6;
 	sk->sk_protocol		= protocol;
 
@@ -215,6 +225,7 @@ lookup_protocol:
 	np->pmtudisc	= IPV6_PMTUDISC_WANT;
 	np->repflow	= net->ipv6.sysctl.flowlabel_reflect & FLOWLABEL_REFLECT_ESTABLISHED;
 	sk->sk_ipv6only	= net->ipv6.sysctl.bindv6only;
+	sk->sk_txrehash = READ_ONCE(net->core.sysctl_txrehash);
 
 	/* Init the ipv4 part of the socket since we can have sockets
 	 * using v6 API for ipv4.
@@ -403,10 +414,10 @@ static int __inet6_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len,
 	/* Make sure we are allowed to bind here. */
 	if (snum || !(inet->bind_address_no_port ||
 		      (flags & BIND_FORCE_ADDRESS_NO_PORT))) {
-		if (sk->sk_prot->get_port(sk, snum)) {
+		err = sk->sk_prot->get_port(sk, snum);
+		if (err) {
 			sk->sk_ipv6only = saved_ipv6only;
 			inet_reset_saddr(sk);
-			err = -EADDRINUSE;
 			goto out;
 		}
 		if (!(flags & BIND_FROM_BPF)) {
@@ -509,6 +520,12 @@ void inet6_destroy_sock(struct sock *sk)
 	}
 }
 EXPORT_SYMBOL_GPL(inet6_destroy_sock);
+
+void inet6_cleanup_sock(struct sock *sk)
+{
+	inet6_destroy_sock(sk);
+}
+EXPORT_SYMBOL_GPL(inet6_cleanup_sock);
 
 /*
  *	This does both peername and sockname.
@@ -697,6 +714,7 @@ const struct proto_ops inet6_stream_ops = {
 #ifdef CONFIG_MMU
 	.mmap		   = tcp_mmap,
 #endif
+	.splice_eof	   = inet_splice_eof,
 	.sendpage	   = inet_sendpage,
 	.sendmsg_locked    = tcp_sendmsg_locked,
 	.sendpage_locked   = tcp_sendpage_locked,
@@ -1057,6 +1075,9 @@ static const struct ipv6_stub ipv6_stub_impl = {
 static const struct ipv6_bpf_stub ipv6_bpf_stub_impl = {
 	.inet6_bind = __inet6_bind,
 	.udp6_lib_lookup = __udp6_lib_lookup,
+	.ipv6_setsockopt = do_ipv6_setsockopt,
+	.ipv6_getsockopt = do_ipv6_getsockopt,
+	.ipv6_dev_get_saddr = ipv6_dev_get_saddr,
 };
 
 static int __init inet6_init(void)
@@ -1070,12 +1091,12 @@ static int __init inet6_init(void)
 	for (r = &inetsw6[0]; r < &inetsw6[SOCK_MAX]; ++r)
 		INIT_LIST_HEAD(r);
 
+	raw_hashinfo_init(&raw_v6_hashinfo);
+
 	if (disable_ipv6_mod) {
 		pr_info("Loaded, but administratively disabled, reboot required to enable\n");
 		goto out;
 	}
-
-	raw_hashinfo_init(&raw_v6_hashinfo);
 
 	err = proto_register(&tcpv6_prot, 1);
 	if (err)

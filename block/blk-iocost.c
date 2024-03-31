@@ -232,7 +232,9 @@ enum {
 
 	/* 1/64k is granular enough and can easily be handled w/ u32 */
 	WEIGHT_ONE		= 1 << 16,
+};
 
+enum {
 	/*
 	 * As vtime is used to calculate the cost of each IO, it needs to
 	 * be fairly high precision.  For example, it should be able to
@@ -256,6 +258,11 @@ enum {
 	VRATE_MIN		= VTIME_PER_USEC * VRATE_MIN_PPM / MILLION,
 	VRATE_CLAMP_ADJ_PCT	= 4,
 
+	/* switch iff the conditions are met for longer than this */
+	AUTOP_CYCLE_NSEC	= 10LLU * NSEC_PER_SEC,
+};
+
+enum {
 	/* if IOs end up waiting for requests, issue less */
 	RQ_WAIT_BUSY_PCT	= 5,
 
@@ -293,9 +300,6 @@ enum {
 
 	/* don't let cmds which take a very long time pin lagging for too long */
 	MAX_LAGGING_PERIODS	= 10,
-
-	/* switch iff the conditions are met for longer than this */
-	AUTOP_CYCLE_NSEC	= 10LLU * NSEC_PER_SEC,
 
 	/*
 	 * Count IO size in 4k pages.  The 12bit shift helps keeping
@@ -664,17 +668,13 @@ static struct ioc *q_to_ioc(struct request_queue *q)
 	return rqos_to_ioc(rq_qos_id(q, RQ_QOS_COST));
 }
 
-static const char *q_name(struct request_queue *q)
-{
-	if (blk_queue_registered(q))
-		return kobject_name(q->kobj.parent);
-	else
-		return "<unknown>";
-}
-
 static const char __maybe_unused *ioc_name(struct ioc *ioc)
 {
-	return q_name(ioc->rqos.q);
+	struct gendisk *disk = ioc->rqos.q->disk;
+
+	if (!disk)
+		return "<unknown>";
+	return disk->disk_name;
 }
 
 static struct ioc_gq *pd_to_iocg(struct blkg_policy_data *pd)
@@ -869,9 +869,14 @@ static void calc_lcoefs(u64 bps, u64 seqiops, u64 randiops,
 
 	*page = *seqio = *randio = 0;
 
-	if (bps)
-		*page = DIV64_U64_ROUND_UP(VTIME_PER_SEC,
-					   DIV_ROUND_UP_ULL(bps, IOC_PAGE_SIZE));
+	if (bps) {
+		u64 bps_pages = DIV_ROUND_UP_ULL(bps, IOC_PAGE_SIZE);
+
+		if (bps_pages)
+			*page = DIV64_U64_ROUND_UP(VTIME_PER_SEC, bps_pages);
+		else
+			*page = 1;
+	}
 
 	if (seqiops) {
 		v = DIV64_U64_ROUND_UP(VTIME_PER_SEC, seqiops);
@@ -1332,6 +1337,13 @@ static bool iocg_kick_delay(struct ioc_gq *iocg, struct ioc_now *now)
 
 	lockdep_assert_held(&iocg->waitq.lock);
 
+	/*
+	 * If the delay is set by another CPU, we may be in the past. No need to
+	 * change anything if so. This avoids decay calculation underflow.
+	 */
+	if (time_before64(now->now, iocg->delay_at))
+		return false;
+
 	/* calculate the current delay in effect - 1/2 every second */
 	tdelta = now->now - iocg->delay_at;
 	if (iocg->delay)
@@ -1430,7 +1442,7 @@ static int iocg_wake_fn(struct wait_queue_entry *wq_entry, unsigned mode,
 			int flags, void *key)
 {
 	struct iocg_wait *wait = container_of(wq_entry, struct iocg_wait, wait);
-	struct iocg_wake_ctx *ctx = (struct iocg_wake_ctx *)key;
+	struct iocg_wake_ctx *ctx = key;
 	u64 cost = abs_cost_to_cost(wait->abs_cost, ctx->hw_inuse);
 
 	ctx->vbudget -= cost;
@@ -2432,6 +2444,7 @@ static u64 adjust_inuse_and_calc_cost(struct ioc_gq *iocg, u64 vtime,
 	u32 hwi, adj_step;
 	s64 margin;
 	u64 cost, new_inuse;
+	unsigned long flags;
 
 	current_hweight(iocg, NULL, &hwi);
 	old_hwi = hwi;
@@ -2450,11 +2463,11 @@ static u64 adjust_inuse_and_calc_cost(struct ioc_gq *iocg, u64 vtime,
 	    iocg->inuse == iocg->active)
 		return cost;
 
-	spin_lock_irq(&ioc->lock);
+	spin_lock_irqsave(&ioc->lock, flags);
 
 	/* we own inuse only when @iocg is in the normal active state */
 	if (iocg->abs_vdebt || list_empty(&iocg->active_list)) {
-		spin_unlock_irq(&ioc->lock);
+		spin_unlock_irqrestore(&ioc->lock, flags);
 		return cost;
 	}
 
@@ -2475,7 +2488,7 @@ static u64 adjust_inuse_and_calc_cost(struct ioc_gq *iocg, u64 vtime,
 	} while (time_after64(vtime + cost, now->vnow) &&
 		 iocg->inuse != iocg->active);
 
-	spin_unlock_irq(&ioc->lock);
+	spin_unlock_irqrestore(&ioc->lock, flags);
 
 	TRACE_IOCG_PATH(inuse_adjust, iocg, now,
 			old_inuse, iocg->inuse, old_hwi, hwi);
@@ -2640,7 +2653,7 @@ retry_lock:
 	if (use_debt) {
 		iocg_incur_debt(iocg, abs_cost, &now);
 		if (iocg_kick_delay(iocg, &now))
-			blkcg_schedule_throttle(rqos->q,
+			blkcg_schedule_throttle(rqos->q->disk,
 					(bio->bi_opf & REQ_SWAP) == REQ_SWAP);
 		iocg_unlock(iocg, ioc_locked, &flags);
 		return;
@@ -2741,7 +2754,7 @@ static void ioc_rqos_merge(struct rq_qos *rqos, struct request *rq,
 	if (likely(!list_empty(&iocg->active_list))) {
 		iocg_incur_debt(iocg, abs_cost, &now);
 		if (iocg_kick_delay(iocg, &now))
-			blkcg_schedule_throttle(rqos->q,
+			blkcg_schedule_throttle(rqos->q->disk,
 					(bio->bi_opf & REQ_SWAP) == REQ_SWAP);
 	} else {
 		iocg_commit_bio(iocg, bio, abs_cost, cost);
@@ -2832,8 +2845,9 @@ static struct rq_qos_ops ioc_rqos_ops = {
 	.exit = ioc_rqos_exit,
 };
 
-static int blk_iocost_init(struct request_queue *q)
+static int blk_iocost_init(struct gendisk *disk)
 {
+	struct request_queue *q = disk->queue;
 	struct ioc *ioc;
 	struct rq_qos *rqos;
 	int i, cpu, ret;
@@ -3170,6 +3184,7 @@ static ssize_t ioc_qos_write(struct kernfs_open_file *of, char *input,
 			     size_t nbytes, loff_t off)
 {
 	struct block_device *bdev;
+	struct gendisk *disk;
 	struct ioc *ioc;
 	u32 qos[NR_QOS_PARAMS];
 	bool enable, user;
@@ -3180,12 +3195,13 @@ static ssize_t ioc_qos_write(struct kernfs_open_file *of, char *input,
 	if (IS_ERR(bdev))
 		return PTR_ERR(bdev);
 
-	ioc = q_to_ioc(bdev_get_queue(bdev));
+	disk = bdev->bd_disk;
+	ioc = q_to_ioc(disk->queue);
 	if (!ioc) {
-		ret = blk_iocost_init(bdev_get_queue(bdev));
+		ret = blk_iocost_init(disk);
 		if (ret)
 			goto err;
-		ioc = q_to_ioc(bdev_get_queue(bdev));
+		ioc = q_to_ioc(disk->queue);
 	}
 
 	spin_lock_irq(&ioc->lock);
@@ -3262,11 +3278,11 @@ static ssize_t ioc_qos_write(struct kernfs_open_file *of, char *input,
 	spin_lock_irq(&ioc->lock);
 
 	if (enable) {
-		blk_stat_enable_accounting(ioc->rqos.q);
-		blk_queue_flag_set(QUEUE_FLAG_RQ_ALLOC_TIME, ioc->rqos.q);
+		blk_stat_enable_accounting(disk->queue);
+		blk_queue_flag_set(QUEUE_FLAG_RQ_ALLOC_TIME, disk->queue);
 		ioc->enabled = true;
 	} else {
-		blk_queue_flag_clear(QUEUE_FLAG_RQ_ALLOC_TIME, ioc->rqos.q);
+		blk_queue_flag_clear(QUEUE_FLAG_RQ_ALLOC_TIME, disk->queue);
 		ioc->enabled = false;
 	}
 
@@ -3349,7 +3365,7 @@ static ssize_t ioc_cost_model_write(struct kernfs_open_file *of, char *input,
 
 	ioc = q_to_ioc(bdev_get_queue(bdev));
 	if (!ioc) {
-		ret = blk_iocost_init(bdev_get_queue(bdev));
+		ret = blk_iocost_init(bdev->bd_disk);
 		if (ret)
 			goto err;
 		ioc = q_to_ioc(bdev_get_queue(bdev));

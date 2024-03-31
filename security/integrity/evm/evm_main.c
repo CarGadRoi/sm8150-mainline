@@ -318,7 +318,6 @@ int evm_protected_xattr_if_enabled(const char *req_xattr_name)
 /**
  * evm_read_protected_xattrs - read EVM protected xattr names, lengths, values
  * @dentry: dentry of the read xattrs
- * @inode: inode of the read xattrs
  * @buffer: buffer xattr names, lengths or values are copied to
  * @buffer_size: size of buffer
  * @type: n: names, l: lengths, v: values
@@ -390,6 +389,7 @@ int evm_read_protected_xattrs(struct dentry *dentry, u8 *buffer,
  * @xattr_name: requested xattr
  * @xattr_value: requested xattr value
  * @xattr_value_len: requested xattr value length
+ * @iint: inode integrity metadata
  *
  * Calculate the HMAC for the given dentry and verify it against the stored
  * security.evm xattr. For performance, use the xattr value and length
@@ -457,10 +457,21 @@ static int evm_xattr_acl_change(struct user_namespace *mnt_userns,
 	int rc;
 
 	/*
-	 * user_ns is not relevant here, ACL_USER/ACL_GROUP don't have impact
-	 * on the inode mode (see posix_acl_equiv_mode()).
+	 * An earlier comment here mentioned that the idmappings for
+	 * ACL_{GROUP,USER} don't matter since EVM is only interested in the
+	 * mode stored as part of POSIX ACLs. Nonetheless, if it must translate
+	 * from the uapi POSIX ACL representation to the VFS internal POSIX ACL
+	 * representation it should do so correctly. There's no guarantee that
+	 * we won't change POSIX ACLs in a way that ACL_{GROUP,USER} matters
+	 * for the mode at some point and it's difficult to keep track of all
+	 * the LSM and integrity modules and what they do to POSIX ACLs.
+	 *
+	 * Frankly, EVM shouldn't try to interpret the uapi struct for POSIX
+	 * ACLs it received. It requires knowledge that only the VFS is
+	 * guaranteed to have.
 	 */
-	acl = posix_acl_from_xattr(&init_user_ns, xattr_value, xattr_value_len);
+	acl = vfs_set_acl_prepare(mnt_userns, i_user_ns(inode),
+				  xattr_value, xattr_value_len);
 	if (IS_ERR_OR_NULL(acl))
 		return 1;
 
@@ -765,7 +776,9 @@ static int evm_attr_change(struct user_namespace *mnt_userns,
 
 /**
  * evm_inode_setattr - prevent updating an invalid EVM extended attribute
+ * @idmap: idmap of the mount
  * @dentry: pointer to the affected dentry
+ * @attr: iattr structure containing the new file attributes
  *
  * Permit update of file attributes when files have a valid EVM signature,
  * except in the case of them having an immutable portable signature.

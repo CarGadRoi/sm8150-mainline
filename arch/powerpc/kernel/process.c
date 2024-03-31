@@ -127,7 +127,7 @@ unsigned long notrace msr_check_and_set(unsigned long bits)
 		newmsr |= MSR_VSX;
 
 	if (oldmsr != newmsr)
-		mtmsr_isync(newmsr);
+		newmsr = mtmsr_isync_irqsafe(newmsr);
 
 	return newmsr;
 }
@@ -145,7 +145,7 @@ void notrace __msr_check_and_clear(unsigned long bits)
 		newmsr &= ~MSR_VSX;
 
 	if (oldmsr != newmsr)
-		mtmsr_isync(newmsr);
+		mtmsr_isync_irqsafe(newmsr);
 }
 EXPORT_SYMBOL(__msr_check_and_clear);
 
@@ -1163,11 +1163,11 @@ void kvmppc_save_user_regs(void)
 
 	usermsr = current->thread.regs->msr;
 
+	/* Caller has enabled FP/VEC/VSX/TM in MSR */
 	if (usermsr & MSR_FP)
-		save_fpu(current);
-
+		__giveup_fpu(current);
 	if (usermsr & MSR_VEC)
-		save_altivec(current);
+		__giveup_altivec(current);
 
 #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
 	if (usermsr & MSR_TM) {
@@ -1654,11 +1654,6 @@ int set_thread_tidr(struct task_struct *t)
 EXPORT_SYMBOL_GPL(set_thread_tidr);
 
 #endif /* CONFIG_PPC64 */
-
-void
-release_thread(struct task_struct *t)
-{
-}
 
 /*
  * this gets called so that we can store coprocessor state into memory and
@@ -2308,6 +2303,6 @@ void notrace __ppc64_runlatch_off(void)
 unsigned long arch_align_stack(unsigned long sp)
 {
 	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
-		sp -= get_random_int() & ~PAGE_MASK;
+		sp -= prandom_u32_max(PAGE_SIZE);
 	return sp & ~0xf;
 }

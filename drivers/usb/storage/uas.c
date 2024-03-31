@@ -283,7 +283,7 @@ static bool uas_evaluate_response_iu(struct response_iu *riu, struct scsi_cmnd *
 		set_host_byte(cmnd, DID_OK);
 		break;
 	case RC_TMF_NOT_SUPPORTED:
-		set_host_byte(cmnd, DID_TARGET_FAILURE);
+		set_host_byte(cmnd, DID_BAD_TARGET);
 		break;
 	default:
 		uas_log_cmd_state(cmnd, "response iu", response_code);
@@ -877,6 +877,13 @@ static int uas_slave_configure(struct scsi_device *sdev)
 	 */
 	if (devinfo->flags & US_FL_CAPACITY_HEURISTICS)
 		sdev->guess_capacity = 1;
+
+	/*
+	 * Some devices report generic values until the media has been
+	 * accessed. Force a READ(10) prior to querying device
+	 * characteristics.
+	 */
+	sdev->read_before_ms = 1;
 
 	/*
 	 * Some devices don't like MODE SENSE with page=0x3f,

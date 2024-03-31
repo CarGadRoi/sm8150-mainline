@@ -12,7 +12,7 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/of.h>
-#include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/pm_opp.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
@@ -398,7 +398,7 @@ fail_put_node:
 	return ret;
 }
 
-static int ti_cpufreq_init(void)
+static int __init ti_cpufreq_init(void)
 {
 	const struct of_device_id *match;
 

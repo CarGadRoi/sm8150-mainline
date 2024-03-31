@@ -75,13 +75,15 @@ static bool fw_devlink_best_effort;
  * are ignored and there is no reference counting.
  */
 static int __fwnode_link_add(struct fwnode_handle *con,
-			     struct fwnode_handle *sup)
+			     struct fwnode_handle *sup, u8 flags)
 {
 	struct fwnode_link *link;
 
 	list_for_each_entry(link, &sup->consumers, s_hook)
-		if (link->consumer == con)
+		if (link->consumer == con) {
+			link->flags |= flags;
 			return 0;
+		}
 
 	link = kzalloc(sizeof(*link), GFP_KERNEL);
 	if (!link)
@@ -91,6 +93,7 @@ static int __fwnode_link_add(struct fwnode_handle *con,
 	INIT_LIST_HEAD(&link->s_hook);
 	link->consumer = con;
 	INIT_LIST_HEAD(&link->c_hook);
+	link->flags = flags;
 
 	list_add(&link->s_hook, &sup->consumers);
 	list_add(&link->c_hook, &con->suppliers);
@@ -102,10 +105,10 @@ static int __fwnode_link_add(struct fwnode_handle *con,
 
 int fwnode_link_add(struct fwnode_handle *con, struct fwnode_handle *sup)
 {
-	int ret = 0;
+	int ret;
 
 	mutex_lock(&fwnode_link_lock);
-	ret = __fwnode_link_add(con, sup);
+	ret = __fwnode_link_add(con, sup, 0);
 	mutex_unlock(&fwnode_link_lock);
 	return ret;
 }
@@ -211,7 +214,7 @@ static void __fwnode_links_move_consumers(struct fwnode_handle *from,
 	struct fwnode_link *link, *tmp;
 
 	list_for_each_entry_safe(link, tmp, &from->consumers, s_hook) {
-		__fwnode_link_add(link->consumer, to);
+		__fwnode_link_add(link->consumer, to, link->flags);
 		__fwnode_link_del(link);
 	}
 }
@@ -334,10 +337,12 @@ static bool device_is_ancestor(struct device *dev, struct device *target)
 	return false;
 }
 
+#define DL_MARKER_FLAGS		(DL_FLAG_INFERRED | \
+				 DL_FLAG_CYCLE | \
+				 DL_FLAG_MANAGED)
 static inline bool device_link_flag_is_sync_state_only(u32 flags)
 {
-	return (flags & ~(DL_FLAG_INFERRED | DL_FLAG_CYCLE))
-		== (DL_FLAG_SYNC_STATE_ONLY | DL_FLAG_MANAGED);
+	return (flags & ~DL_MARKER_FLAGS) == DL_FLAG_SYNC_STATE_ONLY;
 }
 
 /**
@@ -1061,11 +1066,9 @@ static struct fwnode_handle *fwnode_links_check_suppliers(
 	if (!fwnode || fw_devlink_is_permissive())
 		return NULL;
 
-	list_for_each_entry(link, &fwnode->suppliers, c_hook) {
-		if (link->flags & FWLINK_FLAG_CYCLE)
-			continue;
-		return link->supplier;
-	}
+	list_for_each_entry(link, &fwnode->suppliers, c_hook)
+		if (!(link->flags & FWLINK_FLAG_CYCLE))
+			return link->supplier;
 
 	return NULL;
 }
@@ -1718,7 +1721,7 @@ static int __init fw_devlink_setup(char *arg)
 }
 early_param("fw_devlink", fw_devlink_setup);
 
-static bool fw_devlink_strict = true;
+static bool fw_devlink_strict;
 static int __init fw_devlink_strict_setup(char *arg)
 {
 	return strtobool(arg, &fw_devlink_strict);
@@ -1902,12 +1905,12 @@ static bool fwnode_ancestor_init_without_drv(struct fwnode_handle *fwnode)
  * Needs to be called with fwnode_lock and device link lock held.
  *
  * Check if @sup_handle or any of its ancestors or suppliers direct/indirectly
- * depend on @con.  This function can detect multiple cyles between @sup_handle
+ * depend on @con. This function can detect multiple cyles between @sup_handle
  * and @con. When such dependency cycles are found, convert all device links
- * created solely by fw_devlink into SYNC_STATE_ONLY device links.  Also, mark
+ * created solely by fw_devlink into SYNC_STATE_ONLY device links. Also, mark
  * all fwnode links in the cycle with FWLINK_FLAG_CYCLE so that when they are
  * converted into a device link in the future, they are created as
- * SYNC_STATE_ONLY device links.  This is the equivalent of doing
+ * SYNC_STATE_ONLY device links. This is the equivalent of doing
  * fw_devlink=permissive just between the devices in the cycle. We need to do
  * this because, at this point, fw_devlink can't tell which of these
  * dependencies is not a real dependency.
@@ -1917,9 +1920,9 @@ static bool fwnode_ancestor_init_without_drv(struct fwnode_handle *fwnode)
 static bool __fw_devlink_relax_cycles(struct device *con,
 				 struct fwnode_handle *sup_handle)
 {
+	struct device *sup_dev = NULL, *par_dev = NULL;
 	struct fwnode_link *link;
 	struct device_link *dev_link;
-	struct device *sup_dev = NULL, *par_dev = NULL;
 	bool ret = false;
 
 	if (!sup_handle)
@@ -1943,9 +1946,9 @@ static bool __fw_devlink_relax_cycles(struct device *con,
 	}
 
 	/*
-	 * If sup_dev is bound to a driver and @con hasn't started binding to
-	 * a driver, @sup_dev can't be a consumer of @con.  So, no need to
-	 * check further.
+	 * If sup_dev is bound to a driver and @con hasn't started binding to a
+	 * driver, sup_dev can't be a consumer of @con. So, no need to check
+	 * further.
 	 */
 	if (sup_dev && sup_dev->links.status ==  DL_DEV_DRIVER_BOUND &&
 	    con->links.status == DL_DEV_NO_DRIVER) {
@@ -1964,22 +1967,20 @@ static bool __fw_devlink_relax_cycles(struct device *con,
 	 * Give priority to device parent over fwnode parent to account for any
 	 * quirks in how fwnodes are converted to devices.
 	 */
-	if (sup_dev) {
-		par_dev = sup_dev->parent;
-		get_device(par_dev);
-	} else {
+	if (sup_dev)
+		par_dev = get_device(sup_dev->parent);
+	else
 		par_dev = fwnode_get_next_parent_dev(sup_handle);
-	}
 
-	if (par_dev)
-		ret |= __fw_devlink_relax_cycles(con, par_dev->fwnode);
+	if (par_dev && __fw_devlink_relax_cycles(con, par_dev->fwnode))
+		ret = true;
 
 	if (!sup_dev)
 		goto out;
 
 	list_for_each_entry(dev_link, &sup_dev->links.suppliers, c_node) {
 		/*
-		 * Ignore a SYNC_STATE_ONLY flag only if it wasn't marked as a
+		 * Ignore a SYNC_STATE_ONLY flag only if it wasn't marked as
 		 * such due to a cycle.
 		 */
 		if (device_link_flag_is_sync_state_only(dev_link->flags) &&
@@ -2055,9 +2056,14 @@ static int fw_devlink_create_devlink(struct device *con,
 
 	/*
 	 * SYNC_STATE_ONLY device links don't block probing and supports cycles.
-	 * So cycle detection isn't necessary and shouldn't be done.
+	 * So, one might expect that cycle detection isn't necessary for them.
+	 * However, if the device link was marked as SYNC_STATE_ONLY because
+	 * it's part of a cycle, then we still need to do cycle detection. This
+	 * is because the consumer and supplier might be part of multiple cycles
+	 * and we need to detect all those cycles.
 	 */
-	if (!(flags & DL_FLAG_SYNC_STATE_ONLY)) {
+	if (!device_link_flag_is_sync_state_only(flags) ||
+	    flags & DL_FLAG_CYCLE) {
 		device_links_write_lock();
 		if (__fw_devlink_relax_cycles(con, sup_handle)) {
 			__fwnode_link_cycle(link);
@@ -2068,7 +2074,11 @@ static int fw_devlink_create_devlink(struct device *con,
 		device_links_write_unlock();
 	}
 
-	sup_dev = get_dev_from_fwnode(sup_handle);
+	if (sup_handle->flags & FWNODE_FLAG_NOT_DEVICE)
+		sup_dev = fwnode_get_next_parent_dev(sup_handle);
+	else
+		sup_dev = get_dev_from_fwnode(sup_handle);
+
 	if (sup_dev) {
 		/*
 		 * If it's one of those drivers that don't actually bind to
@@ -2084,9 +2094,9 @@ static int fw_devlink_create_devlink(struct device *con,
 			goto out;
 		}
 
-		if (!device_link_add(con, sup_dev, flags)) {
-			dev_err(con, "Failed to create device link with %s\n",
-				dev_name(sup_dev));
+		if (con != sup_dev && !device_link_add(con, sup_dev, flags)) {
+			dev_err(con, "Failed to create device link (0x%x) with %s\n",
+				flags, dev_name(sup_dev));
 			ret = -EINVAL;
 		}
 
@@ -2187,10 +2197,7 @@ static void __fw_devlink_link_to_consumers(struct device *dev)
  *
  * The function creates normal (non-SYNC_STATE_ONLY) device links between @dev
  * and the real suppliers of @dev. Once these device links are created, the
- * fwnode links are deleted. When such device links are successfully created,
- * this function is called recursively on those supplier devices. This is
- * needed to detect and break some invalid cycles in fwnode links.  See
- * fw_devlink_create_devlink() for more details.
+ * fwnode links are deleted.
  *
  * In addition, it also looks at all the suppliers of the entire fwnode tree
  * because some of the child devices of @dev that have not been added yet
@@ -2656,7 +2663,7 @@ static ssize_t uevent_store(struct device *dev, struct device_attribute *attr,
 	rc = kobject_synth_uevent(&dev->kobj, buf, count);
 
 	if (rc) {
-		dev_err(dev, "uevent: failed to send synthetic uevent\n");
+		dev_err(dev, "uevent: failed to send synthetic uevent: %d\n", rc);
 		return rc;
 	}
 
@@ -3598,7 +3605,7 @@ int device_add(struct device *dev)
 	/* we require the name to be set before, and pass NULL */
 	error = kobject_add(&dev->kobj, dev->kobj.parent, NULL);
 	if (error) {
-		glue_dir = get_glue_dir(dev);
+		glue_dir = kobj;
 		goto Error;
 	}
 
@@ -3698,6 +3705,7 @@ done:
 	device_pm_remove(dev);
 	dpm_sysfs_remove(dev);
  DPMError:
+	dev->driver = NULL;
 	bus_remove_device(dev);
  BusError:
 	device_remove_attrs(dev);
@@ -3853,6 +3861,17 @@ void device_del(struct device *dev)
 	driver_deferred_probe_del(dev);
 	device_platform_notify_remove(dev);
 	device_links_purge(dev);
+
+	/*
+	 * If a device does not have a driver attached, we need to clean
+	 * up any managed resources. We do this in device_release(), but
+	 * it's never called (and we leak the device) if a managed
+	 * resource holds a reference to the device. So release all
+	 * managed resources here, like we do in driver_detach(). We
+	 * still need to do so again in device_release() in case someone
+	 * adds a new resource after this point, though.
+	 */
+	devres_release_all(dev);
 
 	if (dev->bus)
 		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
@@ -4317,7 +4336,7 @@ device_create_groups_vargs(struct class *class, struct device *parent,
 	struct device *dev = NULL;
 	int retval = -ENODEV;
 
-	if (class == NULL || IS_ERR(class))
+	if (IS_ERR_OR_NULL(class))
 		goto error;
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);

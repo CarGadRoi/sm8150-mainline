@@ -52,6 +52,8 @@ static LIST_HEAD(tls_device_list);
 static LIST_HEAD(tls_device_down_list);
 static DEFINE_SPINLOCK(tls_device_lock);
 
+static struct page *dummy_page;
+
 static void tls_device_free_ctx(struct tls_context *ctx)
 {
 	if (ctx->tx_conf == TLS_HW) {
@@ -313,36 +315,33 @@ static int tls_push_record(struct sock *sk,
 	return tls_push_sg(sk, ctx, offload_ctx->sg_tx_data, 0, flags);
 }
 
-static int tls_device_record_close(struct sock *sk,
-				   struct tls_context *ctx,
-				   struct tls_record_info *record,
-				   struct page_frag *pfrag,
-				   unsigned char record_type)
+static void tls_device_record_close(struct sock *sk,
+				    struct tls_context *ctx,
+				    struct tls_record_info *record,
+				    struct page_frag *pfrag,
+				    unsigned char record_type)
 {
 	struct tls_prot_info *prot = &ctx->prot_info;
-	int ret;
+	struct page_frag dummy_tag_frag;
 
 	/* append tag
 	 * device will fill in the tag, we just need to append a placeholder
 	 * use socket memory to improve coalescing (re-using a single buffer
 	 * increases frag count)
-	 * if we can't allocate memory now, steal some back from data
+	 * if we can't allocate memory now use the dummy page
 	 */
-	if (likely(skb_page_frag_refill(prot->tag_size, pfrag,
-					sk->sk_allocation))) {
-		ret = 0;
-		tls_append_frag(record, pfrag, prot->tag_size);
-	} else {
-		ret = prot->tag_size;
-		if (record->len <= prot->overhead_size)
-			return -ENOMEM;
+	if (unlikely(pfrag->size - pfrag->offset < prot->tag_size) &&
+	    !skb_page_frag_refill(prot->tag_size, pfrag, sk->sk_allocation)) {
+		dummy_tag_frag.page = dummy_page;
+		dummy_tag_frag.offset = 0;
+		pfrag = &dummy_tag_frag;
 	}
+	tls_append_frag(record, pfrag, prot->tag_size);
 
 	/* fill prepend */
 	tls_fill_prepend(ctx, skb_frag_address(&record->frags[0]),
 			 record->len - prot->overhead_size,
 			 record_type);
-	return ret;
 }
 
 static int tls_create_new_record(struct tls_offload_context_tx *offload_ctx,
@@ -508,6 +507,8 @@ handle_error:
 			zc_pfrag.offset = iter_offset.offset;
 			zc_pfrag.size = copy;
 			tls_append_frag(record, &zc_pfrag, copy);
+
+			iter_offset.offset += copy;
 		} else if (copy) {
 			copy = min_t(size_t, copy, pfrag->size - pfrag->offset);
 
@@ -533,18 +534,8 @@ last_record:
 
 		if (done || record->len >= max_open_record_len ||
 		    (record->num_frags >= MAX_SKB_FRAGS - 1)) {
-			rc = tls_device_record_close(sk, tls_ctx, record,
-						     pfrag, record_type);
-			if (rc) {
-				if (rc > 0) {
-					size += rc;
-				} else {
-					size = orig_size;
-					destroy_record(record);
-					ctx->open_record = NULL;
-					break;
-				}
-			}
+			tls_device_record_close(sk, tls_ctx, record,
+						pfrag, record_type);
 
 			rc = tls_push_record(sk,
 					     tls_ctx,
@@ -620,7 +611,7 @@ int tls_device_sendpage(struct sock *sk, struct page *page,
 	kaddr = kmap(page);
 	iov.iov_base = kaddr + offset;
 	iov.iov_len = size;
-	iov_iter_kvec(&msg_iter, WRITE, &iov, 1, size);
+	iov_iter_kvec(&msg_iter, ITER_SOURCE, &iov, 1, size);
 	iter_offset.msg_iter = &msg_iter;
 	rc = tls_push_data(sk, iter_offset, size, flags, TLS_RECORD_TYPE_DATA,
 			   NULL);
@@ -697,7 +688,7 @@ static int tls_device_push_pending_record(struct sock *sk, int flags)
 	union tls_iter_offset iter;
 	struct iov_iter msg_iter;
 
-	iov_iter_kvec(&msg_iter, WRITE, NULL, 0, 0);
+	iov_iter_kvec(&msg_iter, ITER_SOURCE, NULL, 0, 0);
 	iter.msg_iter = &msg_iter;
 	return tls_push_data(sk, iter, 0, flags, TLS_RECORD_TYPE_DATA, NULL);
 }
@@ -902,17 +893,28 @@ static void tls_device_core_ctrl_rx_resync(struct tls_context *tls_ctx,
 }
 
 static int
-tls_device_reencrypt(struct sock *sk, struct tls_sw_context_rx *sw_ctx)
+tls_device_reencrypt(struct sock *sk, struct tls_context *tls_ctx)
 {
+	struct tls_sw_context_rx *sw_ctx = tls_sw_ctx_rx(tls_ctx);
+	const struct tls_cipher_size_desc *cipher_sz;
 	int err, offset, copy, data_len, pos;
 	struct sk_buff *skb, *skb_iter;
 	struct scatterlist sg[1];
 	struct strp_msg *rxm;
 	char *orig_buf, *buf;
 
+	switch (tls_ctx->crypto_recv.info.cipher_type) {
+	case TLS_CIPHER_AES_GCM_128:
+	case TLS_CIPHER_AES_GCM_256:
+		break;
+	default:
+		return -EINVAL;
+	}
+	cipher_sz = &tls_cipher_size_desc[tls_ctx->crypto_recv.info.cipher_type];
+
 	rxm = strp_msg(tls_strp_msg(sw_ctx));
-	orig_buf = kmalloc(rxm->full_len + TLS_HEADER_SIZE +
-			   TLS_CIPHER_AES_GCM_128_IV_SIZE, sk->sk_allocation);
+	orig_buf = kmalloc(rxm->full_len + TLS_HEADER_SIZE + cipher_sz->iv,
+			   sk->sk_allocation);
 	if (!orig_buf)
 		return -ENOMEM;
 	buf = orig_buf;
@@ -927,10 +929,8 @@ tls_device_reencrypt(struct sock *sk, struct tls_sw_context_rx *sw_ctx)
 
 	sg_init_table(sg, 1);
 	sg_set_buf(&sg[0], buf,
-		   rxm->full_len + TLS_HEADER_SIZE +
-		   TLS_CIPHER_AES_GCM_128_IV_SIZE);
-	err = skb_copy_bits(skb, offset, buf,
-			    TLS_HEADER_SIZE + TLS_CIPHER_AES_GCM_128_IV_SIZE);
+		   rxm->full_len + TLS_HEADER_SIZE + cipher_sz->iv);
+	err = skb_copy_bits(skb, offset, buf, TLS_HEADER_SIZE + cipher_sz->iv);
 	if (err)
 		goto free_buf;
 
@@ -941,7 +941,7 @@ tls_device_reencrypt(struct sock *sk, struct tls_sw_context_rx *sw_ctx)
 	else
 		err = 0;
 
-	data_len = rxm->full_len - TLS_CIPHER_AES_GCM_128_TAG_SIZE;
+	data_len = rxm->full_len - cipher_sz->tag;
 
 	if (skb_pagelen(skb) > offset) {
 		copy = min_t(int, skb_pagelen(skb) - offset, data_len);
@@ -996,20 +996,14 @@ int tls_device_decrypted(struct sock *sk, struct tls_context *tls_ctx)
 	struct tls_sw_context_rx *sw_ctx = tls_sw_ctx_rx(tls_ctx);
 	struct sk_buff *skb = tls_strp_msg(sw_ctx);
 	struct strp_msg *rxm = strp_msg(skb);
-	int is_decrypted = skb->decrypted;
-	int is_encrypted = !is_decrypted;
-	struct sk_buff *skb_iter;
-	int left;
+	int is_decrypted, is_encrypted;
 
-	left = rxm->full_len - skb->len;
-	/* Check if all the data is decrypted already */
-	skb_iter = skb_shinfo(skb)->frag_list;
-	while (skb_iter && left > 0) {
-		is_decrypted &= skb_iter->decrypted;
-		is_encrypted &= !skb_iter->decrypted;
-
-		left -= skb_iter->len;
-		skb_iter = skb_iter->next;
+	if (!tls_strp_msg_mixed_decrypted(sw_ctx)) {
+		is_decrypted = skb->decrypted;
+		is_encrypted = !is_decrypted;
+	} else {
+		is_decrypted = 0;
+		is_encrypted = 0;
 	}
 
 	trace_tls_device_decrypted(sk, tcp_sk(sk)->copied_seq - rxm->full_len,
@@ -1024,7 +1018,7 @@ int tls_device_decrypted(struct sock *sk, struct tls_context *tls_ctx)
 		 * likely have initial fragments decrypted, and final ones not
 		 * decrypted. We need to reencrypt that single SKB.
 		 */
-		return tls_device_reencrypt(sk, sw_ctx);
+		return tls_device_reencrypt(sk, tls_ctx);
 	}
 
 	/* Return immediately if the record is either entirely plaintext or
@@ -1041,7 +1035,7 @@ int tls_device_decrypted(struct sock *sk, struct tls_context *tls_ctx)
 	}
 
 	ctx->resync_nh_reset = 1;
-	return tls_device_reencrypt(sk, sw_ctx);
+	return tls_device_reencrypt(sk, tls_ctx);
 }
 
 static void tls_device_attach(struct tls_context *ctx, struct sock *sk,
@@ -1062,9 +1056,9 @@ static void tls_device_attach(struct tls_context *ctx, struct sock *sk,
 
 int tls_set_device_offload(struct sock *sk, struct tls_context *ctx)
 {
-	u16 nonce_size, tag_size, iv_size, rec_seq_size, salt_size;
 	struct tls_context *tls_ctx = tls_get_ctx(sk);
 	struct tls_prot_info *prot = &tls_ctx->prot_info;
+	const struct tls_cipher_size_desc *cipher_sz;
 	struct tls_record_info *start_marker_record;
 	struct tls_offload_context_tx *offload_ctx;
 	struct tls_crypto_info *crypto_info;
@@ -1099,44 +1093,44 @@ int tls_set_device_offload(struct sock *sk, struct tls_context *ctx)
 
 	switch (crypto_info->cipher_type) {
 	case TLS_CIPHER_AES_GCM_128:
-		nonce_size = TLS_CIPHER_AES_GCM_128_IV_SIZE;
-		tag_size = TLS_CIPHER_AES_GCM_128_TAG_SIZE;
-		iv_size = TLS_CIPHER_AES_GCM_128_IV_SIZE;
 		iv = ((struct tls12_crypto_info_aes_gcm_128 *)crypto_info)->iv;
-		rec_seq_size = TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE;
-		salt_size = TLS_CIPHER_AES_GCM_128_SALT_SIZE;
 		rec_seq =
 		 ((struct tls12_crypto_info_aes_gcm_128 *)crypto_info)->rec_seq;
+		break;
+	case TLS_CIPHER_AES_GCM_256:
+		iv = ((struct tls12_crypto_info_aes_gcm_256 *)crypto_info)->iv;
+		rec_seq =
+		 ((struct tls12_crypto_info_aes_gcm_256 *)crypto_info)->rec_seq;
 		break;
 	default:
 		rc = -EINVAL;
 		goto release_netdev;
 	}
+	cipher_sz = &tls_cipher_size_desc[crypto_info->cipher_type];
 
 	/* Sanity-check the rec_seq_size for stack allocations */
-	if (rec_seq_size > TLS_MAX_REC_SEQ_SIZE) {
+	if (cipher_sz->rec_seq > TLS_MAX_REC_SEQ_SIZE) {
 		rc = -EINVAL;
 		goto release_netdev;
 	}
 
 	prot->version = crypto_info->version;
 	prot->cipher_type = crypto_info->cipher_type;
-	prot->prepend_size = TLS_HEADER_SIZE + nonce_size;
-	prot->tag_size = tag_size;
+	prot->prepend_size = TLS_HEADER_SIZE + cipher_sz->iv;
+	prot->tag_size = cipher_sz->tag;
 	prot->overhead_size = prot->prepend_size + prot->tag_size;
-	prot->iv_size = iv_size;
-	prot->salt_size = salt_size;
-	ctx->tx.iv = kmalloc(iv_size + TLS_CIPHER_AES_GCM_128_SALT_SIZE,
-			     GFP_KERNEL);
+	prot->iv_size = cipher_sz->iv;
+	prot->salt_size = cipher_sz->salt;
+	ctx->tx.iv = kmalloc(cipher_sz->iv + cipher_sz->salt, GFP_KERNEL);
 	if (!ctx->tx.iv) {
 		rc = -ENOMEM;
 		goto release_netdev;
 	}
 
-	memcpy(ctx->tx.iv + TLS_CIPHER_AES_GCM_128_SALT_SIZE, iv, iv_size);
+	memcpy(ctx->tx.iv + cipher_sz->salt, iv, cipher_sz->iv);
 
-	prot->rec_seq_size = rec_seq_size;
-	ctx->tx.rec_seq = kmemdup(rec_seq, rec_seq_size, GFP_KERNEL);
+	prot->rec_seq_size = cipher_sz->rec_seq;
+	ctx->tx.rec_seq = kmemdup(rec_seq, cipher_sz->rec_seq, GFP_KERNEL);
 	if (!ctx->tx.rec_seq) {
 		rc = -ENOMEM;
 		goto free_iv;
@@ -1461,14 +1455,26 @@ int __init tls_device_init(void)
 {
 	int err;
 
-	destruct_wq = alloc_workqueue("ktls_device_destruct", 0, 0);
-	if (!destruct_wq)
+	dummy_page = alloc_page(GFP_KERNEL);
+	if (!dummy_page)
 		return -ENOMEM;
+
+	destruct_wq = alloc_workqueue("ktls_device_destruct", 0, 0);
+	if (!destruct_wq) {
+		err = -ENOMEM;
+		goto err_free_dummy;
+	}
 
 	err = register_netdevice_notifier(&tls_dev_notifier);
 	if (err)
-		destroy_workqueue(destruct_wq);
+		goto err_destroy_wq;
 
+	return 0;
+
+err_destroy_wq:
+	destroy_workqueue(destruct_wq);
+err_free_dummy:
+	put_page(dummy_page);
 	return err;
 }
 
@@ -1477,4 +1483,5 @@ void __exit tls_device_cleanup(void)
 	unregister_netdevice_notifier(&tls_dev_notifier);
 	destroy_workqueue(destruct_wq);
 	clean_acked_data_flush();
+	put_page(dummy_page);
 }

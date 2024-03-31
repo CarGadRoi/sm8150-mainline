@@ -258,7 +258,7 @@ extern long exception_handlers[VECSIZE * 128 / sizeof(long)];
 void setup_tlb_handler(int cpu)
 {
 	setup_ptwalker();
-	output_pgtable_bits_defines();
+	local_flush_tlb_all();
 
 	/* The tlb handlers are generated only once */
 	if (cpu == 0) {
@@ -271,12 +271,16 @@ void setup_tlb_handler(int cpu)
 		set_handler(EXCCODE_TLBNR * VECSIZE, handle_tlb_protect, VECSIZE);
 		set_handler(EXCCODE_TLBNX * VECSIZE, handle_tlb_protect, VECSIZE);
 		set_handler(EXCCODE_TLBPE * VECSIZE, handle_tlb_protect, VECSIZE);
-	}
+	} else {
+		int vec_sz __maybe_unused;
+		void *addr __maybe_unused;
+		struct page *page __maybe_unused;
+
+		/* Avoid lockdep warning */
+		rcu_cpu_starting(cpu);
+
 #ifdef CONFIG_NUMA
-	else {
-		void *addr;
-		struct page *page;
-		const int vec_sz = sizeof(exception_handlers);
+		vec_sz = sizeof(exception_handlers);
 
 		if (pcpu_handlers[cpu])
 			return;
@@ -292,8 +296,8 @@ void setup_tlb_handler(int cpu)
 		csr_write64(pcpu_handlers[cpu], LOONGARCH_CSR_EENTRY);
 		csr_write64(pcpu_handlers[cpu], LOONGARCH_CSR_MERRENTRY);
 		csr_write64(pcpu_handlers[cpu] + 80*VECSIZE, LOONGARCH_CSR_TLBRENTRY);
-	}
 #endif
+	}
 }
 
 void tlb_init(int cpu)
@@ -301,6 +305,7 @@ void tlb_init(int cpu)
 	write_csr_pagesize(PS_DEFAULT_SIZE);
 	write_csr_stlbpgsize(PS_DEFAULT_SIZE);
 	write_csr_tlbrefill_pagesize(PS_DEFAULT_SIZE);
+
 	setup_tlb_handler(cpu);
-	local_flush_tlb_all();
+	output_pgtable_bits_defines();
 }

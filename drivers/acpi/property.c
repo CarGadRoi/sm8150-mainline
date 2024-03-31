@@ -304,8 +304,10 @@ static void acpi_init_of_compatible(struct acpi_device *adev)
 		ret = acpi_dev_get_property(adev, "compatible",
 					    ACPI_TYPE_STRING, &of_compatible);
 		if (ret) {
-			if (adev->parent
-			    && adev->parent->flags.of_compatible_ok)
+			struct acpi_device *parent;
+
+			parent = acpi_dev_parent(adev);
+			if (parent && parent->flags.of_compatible_ok)
 				goto out;
 
 			return;
@@ -370,7 +372,7 @@ static bool acpi_tie_nondev_subnodes(struct acpi_device_data *data)
 		bool ret;
 
 		status = acpi_attach_data(dn->handle, acpi_nondev_subnode_tag, dn);
-		if (ACPI_FAILURE(status)) {
+		if (ACPI_FAILURE(status) && status != AE_ALREADY_EXISTS) {
 			acpi_handle_err(dn->handle, "Can't tag data node\n");
 			return false;
 		}
@@ -849,6 +851,7 @@ static int acpi_get_ref_args(struct fwnode_reference_args *args,
  * @index: Index of the reference to return
  * @num_args: Maximum number of arguments after each reference
  * @args: Location to store the returned reference with optional arguments
+ *	  (may be NULL)
  *
  * Find property with @name, verifify that it is a package containing at least
  * one object reference and if so, store the ACPI device object pointer to the
@@ -904,6 +907,9 @@ int __acpi_node_get_property_reference(const struct fwnode_handle *fwnode,
 		device = acpi_fetch_acpi_dev(obj->reference.handle);
 		if (!device)
 			return -EINVAL;
+
+		if (!args)
+			return 0;
 
 		args->fwnode = acpi_fwnode_handle(device);
 		args->nargs = 0;
@@ -1043,11 +1049,10 @@ static int acpi_data_prop_read_single(const struct acpi_device_data *data,
 				break;					\
 			}						\
 			if (__items[i].integer.value > _Generic(__val,	\
-								u8: U8_MAX, \
-								u16: U16_MAX, \
-								u32: U32_MAX, \
-								u64: U64_MAX, \
-								default: 0U)) { \
+								u8 *: U8_MAX, \
+								u16 *: U16_MAX, \
+								u32 *: U32_MAX, \
+								u64 *: U64_MAX)) { \
 				ret = -EOVERFLOW;			\
 				break;					\
 			}						\
@@ -1113,25 +1118,26 @@ static int acpi_data_prop_read(const struct acpi_device_data *data,
 	switch (proptype) {
 	case DEV_PROP_STRING:
 		break;
-	case DEV_PROP_U8 ... DEV_PROP_U64:
+	default:
 		if (obj->type == ACPI_TYPE_BUFFER) {
 			if (nval > obj->buffer.length)
 				return -EOVERFLOW;
-			break;
+		} else {
+			if (nval > obj->package.count)
+				return -EOVERFLOW;
 		}
-		fallthrough;
-	default:
-		if (nval > obj->package.count)
-			return -EOVERFLOW;
 		break;
 	}
 	if (nval == 0)
 		return -EINVAL;
 
-	if (obj->type != ACPI_TYPE_BUFFER)
-		items = obj->package.elements;
-	else
+	if (obj->type == ACPI_TYPE_BUFFER) {
+		if (proptype != DEV_PROP_U8)
+			return -EPROTO;
 		items = obj;
+	} else {
+		items = obj->package.elements;
+	}
 
 	switch (proptype) {
 	case DEV_PROP_U8:
@@ -1268,10 +1274,11 @@ acpi_node_get_parent(const struct fwnode_handle *fwnode)
 		return to_acpi_data_node(fwnode)->parent;
 	}
 	if (is_acpi_device_node(fwnode)) {
-		struct device *dev = to_acpi_device_node(fwnode)->dev.parent;
+		struct acpi_device *parent;
 
-		if (dev)
-			return acpi_fwnode_handle(to_acpi_device(dev));
+		parent = acpi_dev_parent(to_acpi_device_node(fwnode));
+		if (parent)
+			return acpi_fwnode_handle(parent);
 	}
 
 	return NULL;

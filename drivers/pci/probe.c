@@ -994,8 +994,11 @@ static int pci_register_host_bridge(struct pci_host_bridge *bridge)
 	resource_list_for_each_entry_safe(window, n, &resources) {
 		offset = window->offset;
 		res = window->res;
-		if (!res->end)
+		if (!res->flags && !res->start && !res->end) {
+			release_resource(res);
+			resource_list_destroy_entry(window);
 			continue;
+		}
 
 		list_move_tail(&window->node, &bridge->windows);
 
@@ -1297,7 +1300,7 @@ static int pci_scan_bridge_extend(struct pci_bus *bus, struct pci_dev *dev,
 
 	if ((secondary || subordinate) && !pcibios_assign_all_busses() &&
 	    !is_cardbus && !broken) {
-		unsigned int cmax;
+		unsigned int cmax, buses;
 
 		/*
 		 * Bus already configured by firmware, process it in the
@@ -1322,7 +1325,8 @@ static int pci_scan_bridge_extend(struct pci_bus *bus, struct pci_dev *dev,
 			child->bridge_ctl = bctl;
 		}
 
-		cmax = pci_scan_child_bus(child);
+		buses = subordinate - secondary;
+		cmax = pci_scan_child_bus_extend(child, buses);
 		if (cmax > subordinate)
 			pci_warn(dev, "bridge has subordinate %02x but max busn %02x\n",
 				 subordinate, cmax);
@@ -1639,15 +1643,15 @@ static void pci_set_removable(struct pci_dev *dev)
 static bool pci_ext_cfg_is_aliased(struct pci_dev *dev)
 {
 #ifdef CONFIG_PCI_QUIRKS
-	int pos;
+	int pos, ret;
 	u32 header, tmp;
 
 	pci_read_config_dword(dev, PCI_VENDOR_ID, &header);
 
 	for (pos = PCI_CFG_SPACE_SIZE;
 	     pos < PCI_CFG_SPACE_EXP_SIZE; pos += PCI_CFG_SPACE_SIZE) {
-		if (pci_read_config_dword(dev, pos, &tmp) != PCIBIOS_SUCCESSFUL
-		    || header != tmp)
+		ret = pci_read_config_dword(dev, pos, &tmp);
+		if ((ret != PCIBIOS_SUCCESSFUL) || (header != tmp))
 			return false;
 	}
 
@@ -1889,9 +1893,6 @@ int pci_setup_device(struct pci_dev *dev)
 	}
 
 	dev->broken_intx_masking = pci_intx_mask_broken(dev);
-
-	/* Clear errors left from system firmware */
-	pci_write_config_word(dev, PCI_STATUS, 0xffff);
 
 	switch (dev->hdr_type) {		    /* header type */
 	case PCI_HEADER_TYPE_NORMAL:		    /* standard header */
@@ -2306,6 +2307,13 @@ struct pci_dev *pci_alloc_dev(struct pci_bus *bus)
 	INIT_LIST_HEAD(&dev->bus_list);
 	dev->dev.type = &pci_dev_type;
 	dev->bus = pci_bus_get(bus);
+	dev->driver_exclusive_resource = (struct resource) {
+		.name = "PCI Exclusive",
+		.start = 0,
+		.end = -1,
+	};
+
+	spin_lock_init(&dev->pcie_cap_lock);
 #ifdef CONFIG_PCI_MSI
 	raw_spin_lock_init(&dev->msi_lock);
 #endif
@@ -2920,8 +2928,8 @@ static unsigned int pci_scan_child_bus_extend(struct pci_bus *bus,
 		 * hotplug bridges too much during the second scan below.
 		 */
 		used_buses++;
-		if (cmax - max > 1)
-			used_buses += cmax - max - 1;
+		if (max - cmax > 1)
+			used_buses += max - cmax - 1;
 	}
 
 	/* Scan bridges that need to be reconfigured */
@@ -2929,7 +2937,6 @@ static unsigned int pci_scan_child_bus_extend(struct pci_bus *bus,
 		unsigned int buses = 0;
 
 		if (!hotplug_bridges && normal_bridges == 1) {
-
 			/*
 			 * There is only one bridge on the bus (upstream
 			 * port) so it gets all available buses which it
@@ -2938,7 +2945,6 @@ static unsigned int pci_scan_child_bus_extend(struct pci_bus *bus,
 			 */
 			buses = available_buses;
 		} else if (dev->is_hotplug_bridge) {
-
 			/*
 			 * Distribute the extra buses between hotplug
 			 * bridges if any.
@@ -2957,7 +2963,7 @@ static unsigned int pci_scan_child_bus_extend(struct pci_bus *bus,
 	/*
 	 * Make sure a hotplug bridge has at least the minimum requested
 	 * number of buses but allow it to grow up to the maximum available
-	 * bus number of there is room.
+	 * bus number if there is room.
 	 */
 	if (bus->self && bus->self->is_hotplug_bridge) {
 		used_buses = max_t(unsigned int, available_buses,

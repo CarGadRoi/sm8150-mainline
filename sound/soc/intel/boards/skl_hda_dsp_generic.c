@@ -157,6 +157,8 @@ static int skl_hda_fill_card_info(struct snd_soc_acpi_mach_params *mach_params)
 		card->dapm_widgets = skl_hda_widgets;
 		card->num_dapm_widgets = ARRAY_SIZE(skl_hda_widgets);
 		if (!ctx->idisp_codec) {
+			card->dapm_routes = &skl_hda_map[IDISP_ROUTE_COUNT];
+			num_route -= IDISP_ROUTE_COUNT;
 			for (i = 0; i < IDISP_DAI_COUNT; i++) {
 				skl_hda_be_dai_links[i].codecs = dummy_codec;
 				skl_hda_be_dai_links[i].num_codecs =
@@ -190,7 +192,7 @@ static void skl_set_hda_codec_autosuspend_delay(struct snd_soc_card *card)
 			 * all codecs are on the same bus, so it's sufficient
 			 * to look up only the first one
 			 */
-			snd_hda_set_power_save(hda_pvt->codec.bus,
+			snd_hda_set_power_save(hda_pvt->codec->bus,
 					       HDA_CODEC_AUTOSUSPEND_DELAY_MS);
 			break;
 		}

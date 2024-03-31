@@ -17,7 +17,7 @@
  * Currently assumes nano seconds.
  */
 
-struct of_phandle_args;
+struct fwnode_reference_args;
 
 enum iio_shared_by {
 	IIO_SEPARATE,
@@ -429,6 +429,8 @@ struct iio_trigger; /* forward declaration */
  *			provide a custom of_xlate function that reads the
  *			*args* and returns the appropriate index in registered
  *			IIO channels array.
+ * @fwnode_xlate:	fwnode based function pointer to obtain channel specifier index.
+ *			Functionally the same as @of_xlate.
  * @hwfifo_set_watermark: function pointer to set the current hardware
  *			fifo watermark level; see hwfifo_* entries in
  *			Documentation/ABI/testing/sysfs-bus-iio for details on
@@ -508,8 +510,8 @@ struct iio_info {
 	int (*debugfs_reg_access)(struct iio_dev *indio_dev,
 				  unsigned reg, unsigned writeval,
 				  unsigned *readval);
-	int (*of_xlate)(struct iio_dev *indio_dev,
-			const struct of_phandle_args *iiospec);
+	int (*fwnode_xlate)(struct iio_dev *indio_dev,
+			    const struct fwnode_reference_args *iiospec);
 	int (*hwfifo_set_watermark)(struct iio_dev *indio_dev, unsigned val);
 	int (*hwfifo_flush_to_buffer)(struct iio_dev *indio_dev,
 				      unsigned count);
@@ -627,6 +629,8 @@ int __devm_iio_device_register(struct device *dev, struct iio_dev *indio_dev,
 int iio_push_event(struct iio_dev *indio_dev, u64 ev_code, s64 timestamp);
 int iio_device_claim_direct_mode(struct iio_dev *indio_dev);
 void iio_device_release_direct_mode(struct iio_dev *indio_dev);
+int iio_device_claim_buffer_mode(struct iio_dev *indio_dev);
+void iio_device_release_buffer_mode(struct iio_dev *indio_dev);
 
 extern struct bus_type iio_bus_type;
 

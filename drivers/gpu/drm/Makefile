@@ -3,6 +3,8 @@
 # Makefile for the drm device driver.  This driver provides support for the
 # Direct Rendering Infrastructure (DRI) in XFree86 4.1.0 and higher.
 
+CFLAGS-$(CONFIG_DRM_USE_DYNAMIC_DEBUG)	+= -DDYNAMIC_DEBUG_MODULE
+
 drm-y       :=	drm_aperture.o drm_auth.o drm_cache.o \
 		drm_file.o drm_gem.o drm_ioctl.o \
 		drm_drv.o \
@@ -17,7 +19,7 @@ drm-y       :=	drm_aperture.o drm_auth.o drm_cache.o \
 		drm_dumb_buffers.o drm_mode_config.o drm_vblank.o \
 		drm_syncobj.o drm_lease.o drm_writeback.o drm_client.o \
 		drm_client_modeset.o drm_atomic_uapi.o \
-		drm_managed.o drm_vblank_work.o drm_notifier_mi.o
+		drm_managed.o drm_vblank_work.o drm_notifier.o
 drm-$(CONFIG_DRM_LEGACY) += drm_agpsupport.o drm_bufs.o drm_context.o drm_dma.o \
 			    drm_hashtab.o drm_irq.o drm_legacy_misc.o drm_lock.o \
 			    drm_memory.o drm_scatter.o drm_vm.o
@@ -40,9 +42,9 @@ obj-$(CONFIG_DRM_PANEL_ORIENTATION_QUIRKS) += drm_panel_orientation_quirks.o
 
 obj-$(CONFIG_DRM_BUDDY) += drm_buddy.o
 
-drm_cma_helper-y := drm_gem_cma_helper.o
-drm_cma_helper-$(CONFIG_DRM_KMS_HELPER) += drm_fb_cma_helper.o
-obj-$(CONFIG_DRM_GEM_CMA_HELPER) += drm_cma_helper.o
+drm_dma_helper-y := drm_gem_dma_helper.o
+drm_dma_helper-$(CONFIG_DRM_KMS_HELPER) += drm_fb_dma_helper.o
+obj-$(CONFIG_DRM_GEM_DMA_HELPER) += drm_dma_helper.o
 
 drm_shmem_helper-y := drm_gem_shmem_helper.o
 obj-$(CONFIG_DRM_GEM_SHMEM_HELPER) += drm_shmem_helper.o
@@ -75,7 +77,6 @@ obj-$(CONFIG_DRM_KMS_HELPER) += drm_kms_helper.o
 # Drivers and the rest
 #
 
-obj-$(CONFIG_DRM_DEBUG_SELFTEST) += selftests/
 obj-$(CONFIG_DRM_KUNIT_TEST) += tests/
 
 obj-$(CONFIG_DRM_MIPI_DBI) += drm_mipi_dbi.o

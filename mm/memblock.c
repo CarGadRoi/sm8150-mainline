@@ -175,8 +175,9 @@ static inline phys_addr_t memblock_cap_size(phys_addr_t base, phys_addr_t *size)
 /*
  * Address comparison utilities
  */
-static unsigned long __init_memblock memblock_addrs_overlap(phys_addr_t base1, phys_addr_t size1,
-				       phys_addr_t base2, phys_addr_t size2)
+unsigned long __init_memblock
+memblock_addrs_overlap(phys_addr_t base1, phys_addr_t size1, phys_addr_t base2,
+		       phys_addr_t size2)
 {
 	return ((base1 < (base2 + size2)) && (base2 < (base1 + size1)));
 }
@@ -2000,7 +2001,7 @@ static void __init free_unused_memmap(void)
 		 * presume that there are no holes in the memory map inside
 		 * a pageblock
 		 */
-		start = round_down(start, pageblock_nr_pages);
+		start = pageblock_start_pfn(start);
 
 		/*
 		 * If we had a previous bank, and there is a space
@@ -2014,12 +2015,12 @@ static void __init free_unused_memmap(void)
 		 * presume that there are no holes in the memory map inside
 		 * a pageblock
 		 */
-		prev_end = ALIGN(end, pageblock_nr_pages);
+		prev_end = pageblock_align(end);
 	}
 
 #ifdef CONFIG_SPARSEMEM
 	if (!IS_ALIGNED(prev_end, PAGES_PER_SECTION)) {
-		prev_end = ALIGN(end, pageblock_nr_pages);
+		prev_end = pageblock_align(end);
 		free_memmap(prev_end, ALIGN(prev_end, PAGES_PER_SECTION));
 	}
 #endif

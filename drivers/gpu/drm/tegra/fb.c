@@ -3,7 +3,7 @@
  * Copyright (C) 2012-2013 Avionic Design GmbH
  * Copyright (C) 2012 NVIDIA CORPORATION.  All rights reserved.
  *
- * Based on the KMS/FB CMA helpers
+ * Based on the KMS/FB DMA helpers
  *   Copyright (C) 2012 Analog Devices Inc.
  */
 
@@ -166,6 +166,7 @@ struct drm_framebuffer *tegra_fb_create(struct drm_device *drm,
 
 		if (gem->size < size) {
 			err = -EINVAL;
+			drm_gem_object_put(gem);
 			goto unreference;
 		}
 

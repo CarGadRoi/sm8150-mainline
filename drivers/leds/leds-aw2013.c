@@ -397,19 +397,18 @@ error_reg:
 	regulator_disable(chip->vcc_regulator);
 
 error:
+	mutex_unlock(&chip->mutex);
 	mutex_destroy(&chip->mutex);
 	return ret;
 }
 
-static int aw2013_remove(struct i2c_client *client)
+static void aw2013_remove(struct i2c_client *client)
 {
 	struct aw2013 *chip = i2c_get_clientdata(client);
 
 	aw2013_chip_disable(chip);
 
 	mutex_destroy(&chip->mutex);
-
-	return 0;
 }
 
 static const struct of_device_id aw2013_match_table[] = {

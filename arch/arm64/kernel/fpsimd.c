@@ -634,7 +634,7 @@ static void fpsimd_to_sve(struct task_struct *task)
 	void *sst = task->thread.sve_state;
 	struct user_fpsimd_state const *fst = &task->thread.uw.fpsimd_state;
 
-	if (!system_supports_sve())
+	if (!system_supports_sve() && !system_supports_sme())
 		return;
 
 	vq = sve_vq_from_vl(thread_get_cur_vl(&task->thread));
@@ -660,7 +660,7 @@ static void sve_to_fpsimd(struct task_struct *task)
 	unsigned int i;
 	__uint128_t const *p;
 
-	if (!system_supports_sve())
+	if (!system_supports_sve() && !system_supports_sme())
 		return;
 
 	vl = thread_get_cur_vl(&task->thread);
@@ -715,10 +715,12 @@ size_t sve_state_size(struct task_struct const *task)
  * do_sve_acc() case, there is no ABI requirement to hide stale data
  * written previously be task.
  */
-void sve_alloc(struct task_struct *task)
+void sve_alloc(struct task_struct *task, bool flush)
 {
 	if (task->thread.sve_state) {
-		memset(task->thread.sve_state, 0, sve_state_size(task));
+		if (flush)
+			memset(task->thread.sve_state, 0,
+			       sve_state_size(task));
 		return;
 	}
 
@@ -789,7 +791,8 @@ void sve_sync_from_fpsimd_zeropad(struct task_struct *task)
 	void *sst = task->thread.sve_state;
 	struct user_fpsimd_state const *fst = &task->thread.uw.fpsimd_state;
 
-	if (!test_tsk_thread_flag(task, TIF_SVE))
+	if (!test_tsk_thread_flag(task, TIF_SVE) &&
+	    !thread_sm_enabled(&task->thread))
 		return;
 
 	vq = sve_vq_from_vl(thread_get_cur_vl(&task->thread));
@@ -801,6 +804,8 @@ void sve_sync_from_fpsimd_zeropad(struct task_struct *task)
 int vec_set_vector_length(struct task_struct *task, enum vec_type type,
 			  unsigned long vl, unsigned long flags)
 {
+	bool free_sme = false;
+
 	if (flags & ~(unsigned long)(PR_SVE_VL_INHERIT |
 				     PR_SVE_SET_VL_ONEXEC))
 		return -EINVAL;
@@ -849,24 +854,39 @@ int vec_set_vector_length(struct task_struct *task, enum vec_type type,
 	    thread_sm_enabled(&task->thread))
 		sve_to_fpsimd(task);
 
-	if (system_supports_sme() && type == ARM64_VEC_SME) {
-		task->thread.svcr &= ~(SVCR_SM_MASK |
-				       SVCR_ZA_MASK);
-		clear_thread_flag(TIF_SME);
+	if (system_supports_sme()) {
+		if (type == ARM64_VEC_SME ||
+		    !(task->thread.svcr & (SVCR_SM_MASK | SVCR_ZA_MASK))) {
+			/*
+			 * We are changing the SME VL or weren't using
+			 * SME anyway, discard the state and force a
+			 * reallocation.
+			 */
+			task->thread.svcr &= ~(SVCR_SM_MASK |
+					       SVCR_ZA_MASK);
+			clear_tsk_thread_flag(task, TIF_SME);
+			free_sme = true;
+		}
 	}
 
 	if (task == current)
 		put_cpu_fpsimd_context();
 
-	/*
-	 * Force reallocation of task SVE and SME state to the correct
-	 * size on next use:
-	 */
-	sve_free(task);
-	if (system_supports_sme() && type == ARM64_VEC_SME)
-		sme_free(task);
-
 	task_set_vl(task, type, vl);
+
+	/*
+	 * Free the changed states if they are not in use, SME will be
+	 * reallocated to the correct size on next use and we just
+	 * allocate SVE now in case it is needed for use in streaming
+	 * mode.
+	 */
+	if (system_supports_sve()) {
+		sve_free(task);
+		sve_alloc(task, true);
+	}
+
+	if (free_sme)
+		sme_free(task);
 
 out:
 	update_tsk_thread_flag(task, vec_vl_inherit_flag(type),
@@ -1113,9 +1133,6 @@ void sve_kernel_enable(const struct arm64_cpu_capabilities *__always_unused p)
  */
 u64 read_zcr_features(void)
 {
-	u64 zcr;
-	unsigned int vq_max;
-
 	/*
 	 * Set the maximum possible VL, and write zeroes to all other
 	 * bits to see if they stick.
@@ -1123,12 +1140,8 @@ u64 read_zcr_features(void)
 	sve_kernel_enable(NULL);
 	write_sysreg_s(ZCR_ELx_LEN_MASK, SYS_ZCR_EL1);
 
-	zcr = read_sysreg_s(SYS_ZCR_EL1);
-	zcr &= ~(u64)ZCR_ELx_LEN_MASK; /* find sticky 1s outside LEN field */
-	vq_max = sve_vq_from_vl(sve_get_vl());
-	zcr |= vq_max - 1; /* set LEN field to maximum effective value */
-
-	return zcr;
+	/* Return LEN value that would be written to get the maximum VL */
+	return sve_vq_from_vl(sve_get_vl()) - 1;
 }
 
 void __init sve_setup(void)
@@ -1219,9 +1232,9 @@ void fpsimd_release_task(struct task_struct *dead_task)
  * the interest of testability and predictability, the architecture
  * guarantees that when ZA is enabled it will be zeroed.
  */
-void sme_alloc(struct task_struct *task)
+void sme_alloc(struct task_struct *task, bool flush)
 {
-	if (task->thread.za_state) {
+	if (task->thread.za_state && flush) {
 		memset(task->thread.za_state, 0, za_state_size(task));
 		return;
 	}
@@ -1272,11 +1285,7 @@ void fa64_kernel_enable(const struct arm64_cpu_capabilities *__always_unused p)
  */
 u64 read_smcr_features(void)
 {
-	u64 smcr;
-	unsigned int vq_max;
-
 	sme_kernel_enable(NULL);
-	sme_smstart_sm();
 
 	/*
 	 * Set the maximum possible VL.
@@ -1284,14 +1293,8 @@ u64 read_smcr_features(void)
 	write_sysreg_s(read_sysreg_s(SYS_SMCR_EL1) | SMCR_ELx_LEN_MASK,
 		       SYS_SMCR_EL1);
 
-	smcr = read_sysreg_s(SYS_SMCR_EL1);
-	smcr &= ~(u64)SMCR_ELx_LEN_MASK; /* Only the LEN field */
-	vq_max = sve_vq_from_vl(sve_get_vl());
-	smcr |= vq_max - 1; /* set LEN field to maximum effective value */
-
-	sme_smstop_sm();
-
-	return smcr;
+	/* Return LEN value that would be written to get the maximum VL */
+	return sve_vq_from_vl(sme_get_vl()) - 1;
 }
 
 void __init sme_setup(void)
@@ -1344,6 +1347,20 @@ void __init sme_setup(void)
 		get_sme_default_vl());
 }
 
+void sme_suspend_exit(void)
+{
+	u64 smcr = 0;
+
+	if (!system_supports_sme())
+		return;
+
+	if (system_supports_fa64())
+		smcr |= SMCR_ELx_FA64;
+
+	write_sysreg_s(smcr, SYS_SMCR_EL1);
+	write_sysreg_s(0, SYS_SMPRI_EL1);
+}
+
 #endif /* CONFIG_ARM64_SME */
 
 static void sve_init_regs(void)
@@ -1388,7 +1405,7 @@ void do_sve_acc(unsigned long esr, struct pt_regs *regs)
 		return;
 	}
 
-	sve_alloc(current);
+	sve_alloc(current, true);
 	if (!current->thread.sve_state) {
 		force_sig(SIGKILL);
 		return;
@@ -1439,8 +1456,8 @@ void do_sme_acc(unsigned long esr, struct pt_regs *regs)
 		return;
 	}
 
-	sve_alloc(current);
-	sme_alloc(current);
+	sve_alloc(current, false);
+	sme_alloc(current, true);
 	if (!current->thread.sve_state || !current->thread.za_state) {
 		force_sig(SIGKILL);
 		return;
@@ -1459,17 +1476,6 @@ void do_sme_acc(unsigned long esr, struct pt_regs *regs)
 
 		fpsimd_bind_task_to_cpu();
 	}
-
-	/*
-	 * If SVE was not already active initialise the SVE registers,
-	 * any non-shared state between the streaming and regular SVE
-	 * registers is architecturally guaranteed to be zeroed when
-	 * we enter streaming mode.  We do not need to initialize ZA
-	 * since ZA must be disabled at this point and enabling ZA is
-	 * architecturally defined to zero ZA.
-	 */
-	if (system_supports_sve() && !test_thread_flag(TIF_SVE))
-		sve_init_regs();
 
 	put_cpu_fpsimd_context();
 }

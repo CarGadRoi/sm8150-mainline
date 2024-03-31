@@ -63,6 +63,7 @@ config QCOM_GSBI
 config QCOM_LLCC
 	tristate "Qualcomm Technologies, Inc. LLCC driver"
 	depends on ARCH_QCOM || COMPILE_TEST
+	select REGMAP_MMIO
 	help
 	  Qualcomm Technologies, Inc. platform specific
 	  Last Level Cache Controller(LLCC) driver for platforms such as,
@@ -129,7 +130,7 @@ config QCOM_RPMHPD
 
 config QCOM_RPMPD
 	tristate "Qualcomm RPM Power domain driver"
-	depends on PM
+	depends on PM && OF
 	depends on QCOM_SMD_RPM
 	select PM_GENERIC_DOMAINS
 	select PM_GENERIC_DOMAINS_OF
@@ -236,6 +237,7 @@ config QCOM_ICC_BWMON
 	tristate "QCOM Interconnect Bandwidth Monitor driver"
 	depends on ARCH_QCOM || COMPILE_TEST
 	select PM_OPP
+	select REGMAP_MMIO
 	help
 	  Sets up driver monitoring bandwidth on various interconnects and
 	  based on that voting for interconnect bandwidth, adjusting their
@@ -245,5 +247,14 @@ config QCOM_ICC_BWMON
 	  Level Cache (memnoc).  Usage of this BWMON allows to remove some of
 	  the fixed bandwidth votes from cpufreq (CPU nodes) thus achieve high
 	  memory throughput even with lower CPU frequencies.
+
+config QCOM_PBS
+	tristate "PBS trigger support for QPNP PMIC"
+	depends on SPMI
+	help
+	  This driver supports configuring software PBS trigger event through PBS
+	  RAM on Qualcomm Technologies, Inc. QPNP PMICs. This module provides
+	  the APIs to the client drivers that wants to send the PBS trigger
+	  event to the PBS RAM.
 
 endmenu

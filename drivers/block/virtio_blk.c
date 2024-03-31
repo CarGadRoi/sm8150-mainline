@@ -130,7 +130,7 @@ static int virtblk_add_req(struct virtqueue *vq, struct virtblk_req *vbr)
 	return virtqueue_add_sgs(vq, sgs, num_out, num_in, vbr, GFP_ATOMIC);
 }
 
-static int virtblk_setup_discard_write_zeroes(struct request *req, bool unmap)
+static int virtblk_setup_discard_write_zeroes_erase(struct request *req, bool unmap)
 {
 	unsigned short segments = blk_rq_nr_discard_segments(req);
 	unsigned short n = 0;
@@ -240,6 +240,9 @@ static blk_status_t virtblk_setup_cmd(struct virtio_device *vdev,
 		type = VIRTIO_BLK_T_WRITE_ZEROES;
 		unmap = !(req->cmd_flags & REQ_NOUNMAP);
 		break;
+	case REQ_OP_SECURE_ERASE:
+		type = VIRTIO_BLK_T_SECURE_ERASE;
+		break;
 	case REQ_OP_DRV_IN:
 		type = VIRTIO_BLK_T_GET_ID;
 		break;
@@ -251,8 +254,9 @@ static blk_status_t virtblk_setup_cmd(struct virtio_device *vdev,
 	vbr->out_hdr.type = cpu_to_virtio32(vdev, type);
 	vbr->out_hdr.ioprio = cpu_to_virtio32(vdev, req_get_ioprio(req));
 
-	if (type == VIRTIO_BLK_T_DISCARD || type == VIRTIO_BLK_T_WRITE_ZEROES) {
-		if (virtblk_setup_discard_write_zeroes(req, unmap))
+	if (type == VIRTIO_BLK_T_DISCARD || type == VIRTIO_BLK_T_WRITE_ZEROES ||
+	    type == VIRTIO_BLK_T_SECURE_ERASE) {
+		if (virtblk_setup_discard_write_zeroes_erase(req, unmap))
 			return BLK_STS_RESOURCE;
 	}
 
@@ -311,24 +315,37 @@ static void virtio_commit_rqs(struct blk_mq_hw_ctx *hctx)
 		virtqueue_notify(vq->vq);
 }
 
+static blk_status_t virtblk_fail_to_queue(struct request *req, int rc)
+{
+	virtblk_cleanup_cmd(req);
+	switch (rc) {
+	case -ENOSPC:
+		return BLK_STS_DEV_RESOURCE;
+	case -ENOMEM:
+		return BLK_STS_RESOURCE;
+	default:
+		return BLK_STS_IOERR;
+	}
+}
+
 static blk_status_t virtblk_prep_rq(struct blk_mq_hw_ctx *hctx,
 					struct virtio_blk *vblk,
 					struct request *req,
 					struct virtblk_req *vbr)
 {
 	blk_status_t status;
+	int num;
 
 	status = virtblk_setup_cmd(vblk->vdev, req, vbr);
 	if (unlikely(status))
 		return status;
 
-	blk_mq_start_request(req);
+	num = virtblk_map_data(hctx, req, vbr);
+	if (unlikely(num < 0))
+		return virtblk_fail_to_queue(req, -ENOMEM);
+	vbr->sg_table.nents = num;
 
-	vbr->sg_table.nents = virtblk_map_data(hctx, req, vbr);
-	if (unlikely(vbr->sg_table.nents < 0)) {
-		virtblk_cleanup_cmd(req);
-		return BLK_STS_RESOURCE;
-	}
+	blk_mq_start_request(req);
 
 	return BLK_STS_OK;
 }
@@ -360,15 +377,7 @@ static blk_status_t virtio_queue_rq(struct blk_mq_hw_ctx *hctx,
 			blk_mq_stop_hw_queue(hctx);
 		spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
 		virtblk_unmap_data(req, vbr);
-		virtblk_cleanup_cmd(req);
-		switch (err) {
-		case -ENOSPC:
-			return BLK_STS_DEV_RESOURCE;
-		case -ENOMEM:
-			return BLK_STS_RESOURCE;
-		default:
-			return BLK_STS_IOERR;
-		}
+		return virtblk_fail_to_queue(req, err);
 	}
 
 	if (bd->last && virtqueue_kick_prepare(vblk->vqs[qid].vq))
@@ -391,8 +400,7 @@ static bool virtblk_prep_rq_batch(struct request *req)
 }
 
 static bool virtblk_add_req_batch(struct virtio_blk_vq *vq,
-					struct request **rqlist,
-					struct request **requeue_list)
+					struct request **rqlist)
 {
 	unsigned long flags;
 	int err;
@@ -408,7 +416,7 @@ static bool virtblk_add_req_batch(struct virtio_blk_vq *vq,
 		if (err) {
 			virtblk_unmap_data(req, vbr);
 			virtblk_cleanup_cmd(req);
-			rq_list_add(requeue_list, req);
+			blk_mq_requeue_request(req, true);
 		}
 	}
 
@@ -436,7 +444,7 @@ static void virtio_queue_rqs(struct request **rqlist)
 
 		if (!next || req->mq_hctx != next->mq_hctx) {
 			req->rq_next = NULL;
-			kick = virtblk_add_req_batch(vq, rqlist, &requeue_list);
+			kick = virtblk_add_req_batch(vq, rqlist);
 			if (kick)
 				virtqueue_notify(vq->vq);
 
@@ -601,12 +609,12 @@ static void virtblk_config_changed(struct virtio_device *vdev)
 static int init_vq(struct virtio_blk *vblk)
 {
 	int err;
-	int i;
+	unsigned short i;
 	vq_callback_t **callbacks;
 	const char **names;
 	struct virtqueue **vqs;
 	unsigned short num_vqs;
-	unsigned int num_poll_vqs;
+	unsigned short num_poll_vqs;
 	struct virtio_device *vdev = vblk->vdev;
 	struct irq_affinity desc = { 0, };
 
@@ -650,13 +658,13 @@ static int init_vq(struct virtio_blk *vblk)
 
 	for (i = 0; i < num_vqs - num_poll_vqs; i++) {
 		callbacks[i] = virtblk_done;
-		snprintf(vblk->vqs[i].name, VQ_NAME_LEN, "req.%d", i);
+		snprintf(vblk->vqs[i].name, VQ_NAME_LEN, "req.%u", i);
 		names[i] = vblk->vqs[i].name;
 	}
 
 	for (; i < num_vqs; i++) {
 		callbacks[i] = NULL;
-		snprintf(vblk->vqs[i].name, VQ_NAME_LEN, "req_poll.%d", i);
+		snprintf(vblk->vqs[i].name, VQ_NAME_LEN, "req_poll.%u", i);
 		names[i] = vblk->vqs[i].name;
 	}
 
@@ -802,7 +810,7 @@ static const struct attribute_group *virtblk_attr_groups[] = {
 	NULL,
 };
 
-static int virtblk_map_queues(struct blk_mq_tag_set *set)
+static void virtblk_map_queues(struct blk_mq_tag_set *set)
 {
 	struct virtio_blk *vblk = set->driver_data;
 	int i, qoff;
@@ -827,8 +835,6 @@ static int virtblk_map_queues(struct blk_mq_tag_set *set)
 		else
 			blk_mq_virtio_map_queues(&set->map[i], vblk->vdev, 0);
 	}
-
-	return 0;
 }
 
 static void virtblk_complete_batch(struct io_comp_batch *iob)
@@ -889,9 +895,12 @@ static int virtblk_probe(struct virtio_device *vdev)
 	int err, index;
 
 	u32 v, blk_size, max_size, sg_elems, opt_io_size;
+	u32 max_discard_segs = 0;
+	u32 discard_granularity = 0;
 	u16 min_io_size;
 	u8 physical_block_exp, alignment_offset;
 	unsigned int queue_depth;
+	size_t max_dma_size;
 
 	if (!vdev->config->get) {
 		dev_err(&vdev->dev, "%s failure: config access disabled\n",
@@ -990,7 +999,8 @@ static int virtblk_probe(struct virtio_device *vdev)
 	/* No real sector limit. */
 	blk_queue_max_hw_sectors(q, -1U);
 
-	max_size = virtio_max_dma_size(vdev);
+	max_dma_size = virtio_max_dma_size(vdev);
+	max_size = max_dma_size > U32_MAX ? U32_MAX : max_dma_size;
 
 	/* Host can optionally specify maximum segment size and number of
 	 * segments. */
@@ -1046,33 +1056,99 @@ static int virtblk_probe(struct virtio_device *vdev)
 
 	if (virtio_has_feature(vdev, VIRTIO_BLK_F_DISCARD)) {
 		virtio_cread(vdev, struct virtio_blk_config,
-			     discard_sector_alignment, &v);
-		if (v)
-			q->limits.discard_granularity = v << SECTOR_SHIFT;
-		else
-			q->limits.discard_granularity = blk_size;
+			     discard_sector_alignment, &discard_granularity);
 
 		virtio_cread(vdev, struct virtio_blk_config,
 			     max_discard_sectors, &v);
 		blk_queue_max_discard_sectors(q, v ? v : UINT_MAX);
 
 		virtio_cread(vdev, struct virtio_blk_config, max_discard_seg,
-			     &v);
-
-		/*
-		 * max_discard_seg == 0 is out of spec but we always
-		 * handled it.
-		 */
-		if (!v)
-			v = sg_elems;
-		blk_queue_max_discard_segments(q,
-					       min(v, MAX_DISCARD_SEGMENTS));
+			     &max_discard_segs);
 	}
 
 	if (virtio_has_feature(vdev, VIRTIO_BLK_F_WRITE_ZEROES)) {
 		virtio_cread(vdev, struct virtio_blk_config,
 			     max_write_zeroes_sectors, &v);
 		blk_queue_max_write_zeroes_sectors(q, v ? v : UINT_MAX);
+	}
+
+	/* The discard and secure erase limits are combined since the Linux
+	 * block layer uses the same limit for both commands.
+	 *
+	 * If both VIRTIO_BLK_F_SECURE_ERASE and VIRTIO_BLK_F_DISCARD features
+	 * are negotiated, we will use the minimum between the limits.
+	 *
+	 * discard sector alignment is set to the minimum between discard_sector_alignment
+	 * and secure_erase_sector_alignment.
+	 *
+	 * max discard sectors is set to the minimum between max_discard_seg and
+	 * max_secure_erase_seg.
+	 */
+	if (virtio_has_feature(vdev, VIRTIO_BLK_F_SECURE_ERASE)) {
+
+		virtio_cread(vdev, struct virtio_blk_config,
+			     secure_erase_sector_alignment, &v);
+
+		/* secure_erase_sector_alignment should not be zero, the device should set a
+		 * valid number of sectors.
+		 */
+		if (!v) {
+			dev_err(&vdev->dev,
+				"virtio_blk: secure_erase_sector_alignment can't be 0\n");
+			err = -EINVAL;
+			goto out_cleanup_disk;
+		}
+
+		discard_granularity = min_not_zero(discard_granularity, v);
+
+		virtio_cread(vdev, struct virtio_blk_config,
+			     max_secure_erase_sectors, &v);
+
+		/* max_secure_erase_sectors should not be zero, the device should set a
+		 * valid number of sectors.
+		 */
+		if (!v) {
+			dev_err(&vdev->dev,
+				"virtio_blk: max_secure_erase_sectors can't be 0\n");
+			err = -EINVAL;
+			goto out_cleanup_disk;
+		}
+
+		blk_queue_max_secure_erase_sectors(q, v);
+
+		virtio_cread(vdev, struct virtio_blk_config,
+			     max_secure_erase_seg, &v);
+
+		/* max_secure_erase_seg should not be zero, the device should set a
+		 * valid number of segments
+		 */
+		if (!v) {
+			dev_err(&vdev->dev,
+				"virtio_blk: max_secure_erase_seg can't be 0\n");
+			err = -EINVAL;
+			goto out_cleanup_disk;
+		}
+
+		max_discard_segs = min_not_zero(max_discard_segs, v);
+	}
+
+	if (virtio_has_feature(vdev, VIRTIO_BLK_F_DISCARD) ||
+	    virtio_has_feature(vdev, VIRTIO_BLK_F_SECURE_ERASE)) {
+		/* max_discard_seg and discard_granularity will be 0 only
+		 * if max_discard_seg and discard_sector_alignment fields in the virtio
+		 * config are 0 and VIRTIO_BLK_F_SECURE_ERASE feature is not negotiated.
+		 * In this case, we use default values.
+		 */
+		if (!max_discard_segs)
+			max_discard_segs = sg_elems;
+
+		blk_queue_max_discard_segments(q,
+					       min(max_discard_segs, MAX_DISCARD_SEGMENTS));
+
+		if (discard_granularity)
+			q->limits.discard_granularity = discard_granularity << SECTOR_SHIFT;
+		else
+			q->limits.discard_granularity = blk_size;
 	}
 
 	virtblk_update_capacity(vblk, false);
@@ -1130,13 +1206,14 @@ static int virtblk_freeze(struct virtio_device *vdev)
 {
 	struct virtio_blk *vblk = vdev->priv;
 
+	/* Ensure no requests in virtqueues before deleting vqs. */
+	blk_mq_freeze_queue(vblk->disk->queue);
+
 	/* Ensure we don't receive any more interrupts */
 	virtio_reset_device(vdev);
 
 	/* Make sure no work handler is accessing the device. */
 	flush_work(&vblk->config_work);
-
-	blk_mq_quiesce_queue(vblk->disk->queue);
 
 	vdev->config->del_vqs(vdev);
 	kfree(vblk->vqs);
@@ -1155,7 +1232,7 @@ static int virtblk_restore(struct virtio_device *vdev)
 
 	virtio_device_ready(vdev);
 
-	blk_mq_unquiesce_queue(vblk->disk->queue);
+	blk_mq_unfreeze_queue(vblk->disk->queue);
 	return 0;
 }
 #endif
@@ -1170,6 +1247,7 @@ static unsigned int features_legacy[] = {
 	VIRTIO_BLK_F_RO, VIRTIO_BLK_F_BLK_SIZE,
 	VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_TOPOLOGY, VIRTIO_BLK_F_CONFIG_WCE,
 	VIRTIO_BLK_F_MQ, VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_F_WRITE_ZEROES,
+	VIRTIO_BLK_F_SECURE_ERASE,
 }
 ;
 static unsigned int features[] = {
@@ -1177,6 +1255,7 @@ static unsigned int features[] = {
 	VIRTIO_BLK_F_RO, VIRTIO_BLK_F_BLK_SIZE,
 	VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_TOPOLOGY, VIRTIO_BLK_F_CONFIG_WCE,
 	VIRTIO_BLK_F_MQ, VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_F_WRITE_ZEROES,
+	VIRTIO_BLK_F_SECURE_ERASE,
 };
 
 static struct virtio_driver virtio_blk = {

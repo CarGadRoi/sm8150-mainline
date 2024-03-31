@@ -1384,13 +1384,16 @@ static int kv_dpm_enable(struct amdgpu_device *adev)
 static void kv_dpm_disable(struct amdgpu_device *adev)
 {
 	struct kv_power_info *pi = kv_get_pi(adev);
+	int err;
 
 	amdgpu_irq_put(adev, &adev->pm.dpm.thermal.irq,
 		       AMDGPU_THERMAL_IRQ_LOW_TO_HIGH);
 	amdgpu_irq_put(adev, &adev->pm.dpm.thermal.irq,
 		       AMDGPU_THERMAL_IRQ_HIGH_TO_LOW);
 
-	amdgpu_kv_smc_bapm_enable(adev, false);
+	err = amdgpu_kv_smc_bapm_enable(adev, false);
+	if (err)
+		DRM_ERROR("amdgpu_kv_smc_bapm_enable failed\n");
 
 	if (adev->asic_type == CHIP_MULLINS)
 		kv_enable_nb_dpm(adev, false);
@@ -2745,10 +2748,8 @@ static int kv_parse_power_table(struct amdgpu_device *adev)
 		non_clock_info = (struct _ATOM_PPLIB_NONCLOCK_INFO *)
 			&non_clock_info_array->nonClockInfo[non_clock_array_index];
 		ps = kzalloc(sizeof(struct kv_ps), GFP_KERNEL);
-		if (ps == NULL) {
-			kfree(adev->pm.dpm.ps);
+		if (ps == NULL)
 			return -ENOMEM;
-		}
 		adev->pm.dpm.ps[i].ps_priv = ps;
 		k = 0;
 		idx = (u8 *)&power_state->v2.clockInfoIndex[0];

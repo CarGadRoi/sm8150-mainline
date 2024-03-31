@@ -1081,7 +1081,7 @@ exit:
  * struct available..
  */
 
-/* This generally cooresponds to the debugfs fw_stats file */
+/* This generally corresponds to the debugfs fw_stats file */
 static const char ath10k_gstrings_stats[][ETH_GSTRING_LEN] = {
 	"tx_pkts_nic",
 	"tx_bytes_nic",
@@ -1139,7 +1139,7 @@ void ath10k_debug_get_et_strings(struct ieee80211_hw *hw,
 				 u32 sset, u8 *data)
 {
 	if (sset == ETH_SS_STATS)
-		memcpy(data, *ath10k_gstrings_stats,
+		memcpy(data, ath10k_gstrings_stats,
 		       sizeof(ath10k_gstrings_stats));
 }
 

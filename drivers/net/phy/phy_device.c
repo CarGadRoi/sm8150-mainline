@@ -26,6 +26,7 @@
 #include <linux/netdevice.h>
 #include <linux/phy.h>
 #include <linux/phy_led_triggers.h>
+#include <linux/pse-pd/pse.h>
 #include <linux/property.h>
 #include <linux/sfp.h>
 #include <linux/skbuff.h>
@@ -216,6 +217,7 @@ static void phy_mdio_device_free(struct mdio_device *mdiodev)
 
 static void phy_device_release(struct device *dev)
 {
+	fwnode_handle_put(dev->fwnode);
 	kfree(to_phy_device(dev));
 }
 
@@ -316,11 +318,13 @@ static __maybe_unused int mdio_bus_phy_resume(struct device *dev)
 
 	phydev->suspended_by_mdio_bus = 0;
 
-	/* If we managed to get here with the PHY state machine in a state other
-	 * than PHY_HALTED this is an indication that something went wrong and
-	 * we should most likely be using MAC managed PM and we are not.
+	/* If we managed to get here with the PHY state machine in a state
+	 * neither PHY_HALTED, PHY_READY nor PHY_UP, this is an indication
+	 * that something went wrong and we should most likely be using
+	 * MAC managed PM, but we are not.
 	 */
-	WARN_ON(phydev->state != PHY_HALTED && !phydev->mac_managed_pm);
+	WARN_ON(phydev->state != PHY_HALTED && phydev->state != PHY_READY &&
+		phydev->state != PHY_UP);
 
 	ret = phy_init_hw(phydev);
 	if (ret < 0)
@@ -370,7 +374,7 @@ int phy_register_fixup(const char *bus_id, u32 phy_uid, u32 phy_uid_mask,
 	if (!fixup)
 		return -ENOMEM;
 
-	strlcpy(fixup->bus_id, bus_id, sizeof(fixup->bus_id));
+	strscpy(fixup->bus_id, bus_id, sizeof(fixup->bus_id));
 	fixup->phy_uid = phy_uid;
 	fixup->phy_uid_mask = phy_uid_mask;
 	fixup->run = run;
@@ -520,7 +524,7 @@ phy_id_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct phy_device *phydev = to_phy_device(dev);
 
-	return sprintf(buf, "0x%.8lx\n", (unsigned long)phydev->phy_id);
+	return sysfs_emit(buf, "0x%.8lx\n", (unsigned long)phydev->phy_id);
 }
 static DEVICE_ATTR_RO(phy_id);
 
@@ -535,7 +539,7 @@ phy_interface_show(struct device *dev, struct device_attribute *attr, char *buf)
 	else
 		mode = phy_modes(phydev->interface);
 
-	return sprintf(buf, "%s\n", mode);
+	return sysfs_emit(buf, "%s\n", mode);
 }
 static DEVICE_ATTR_RO(phy_interface);
 
@@ -545,7 +549,7 @@ phy_has_fixups_show(struct device *dev, struct device_attribute *attr,
 {
 	struct phy_device *phydev = to_phy_device(dev);
 
-	return sprintf(buf, "%d\n", phydev->has_fixups);
+	return sysfs_emit(buf, "%d\n", phydev->has_fixups);
 }
 static DEVICE_ATTR_RO(phy_has_fixups);
 
@@ -555,7 +559,7 @@ static ssize_t phy_dev_flags_show(struct device *dev,
 {
 	struct phy_device *phydev = to_phy_device(dev);
 
-	return sprintf(buf, "0x%08x\n", phydev->dev_flags);
+	return sysfs_emit(buf, "0x%08x\n", phydev->dev_flags);
 }
 static DEVICE_ATTR_RO(phy_dev_flags);
 
@@ -989,6 +993,7 @@ EXPORT_SYMBOL(phy_device_register);
 void phy_device_remove(struct phy_device *phydev)
 {
 	unregister_mii_timestamper(phydev->mii_ts);
+	pse_control_put(phydev->psec);
 
 	device_del(&phydev->mdio.dev);
 
@@ -1310,7 +1315,7 @@ phy_standalone_show(struct device *dev, struct device_attribute *attr,
 {
 	struct phy_device *phydev = to_phy_device(dev);
 
-	return sprintf(buf, "%d\n", !phydev->attached_dev);
+	return sysfs_emit(buf, "%d\n", !phydev->attached_dev);
 }
 static DEVICE_ATTR_RO(phy_standalone);
 
@@ -1516,6 +1521,7 @@ error:
 
 error_module_put:
 	module_put(d->driver->owner);
+	d->driver = NULL;
 error_put_device:
 	put_device(d);
 	if (ndev_owner != bus->owner)
@@ -2634,8 +2640,8 @@ EXPORT_SYMBOL(genphy_resume);
 int genphy_loopback(struct phy_device *phydev, bool enable)
 {
 	if (enable) {
-		u16 val, ctl = BMCR_LOOPBACK;
-		int ret;
+		u16 ctl = BMCR_LOOPBACK;
+		int ret, val;
 
 		ctl |= mii_bmcr_encode_fixed(phydev->speed, phydev->duplex);
 
@@ -2887,7 +2893,7 @@ s32 phy_get_internal_delay(struct phy_device *phydev, struct device *dev,
 	if (delay < 0)
 		return delay;
 
-	if (delay && size == 0)
+	if (size == 0)
 		return delay;
 
 	if (delay < delay_values[0] || delay > delay_values[size - 1]) {
@@ -3035,8 +3041,6 @@ static int phy_probe(struct device *dev)
 	if (phydrv->flags & PHY_IS_INTERNAL)
 		phydev->is_internal = true;
 
-	mutex_lock(&phydev->lock);
-
 	/* Deassert the reset signal */
 	phy_device_reset(phydev, 0);
 
@@ -3045,6 +3049,8 @@ static int phy_probe(struct device *dev)
 		if (err)
 			goto out;
 	}
+
+	phy_disable_interrupts(phydev);
 
 	/* Start out supporting everything. Eventually,
 	 * a controller will attach, and may modify one
@@ -3104,11 +3110,9 @@ static int phy_probe(struct device *dev)
 	phydev->state = PHY_READY;
 
 out:
-	/* Assert the reset signal */
+	/* Re-assert the reset signal on error */
 	if (err)
 		phy_device_reset(phydev, 1);
-
-	mutex_unlock(&phydev->lock);
 
 	return err;
 }
@@ -3119,9 +3123,7 @@ static int phy_remove(struct device *dev)
 
 	cancel_delayed_work_sync(&phydev->state_queue);
 
-	mutex_lock(&phydev->lock);
 	phydev->state = PHY_DOWN;
-	mutex_unlock(&phydev->lock);
 
 	sfp_bus_del_upstream(phydev->sfp_bus);
 	phydev->sfp_bus = NULL;
@@ -3135,16 +3137,6 @@ static int phy_remove(struct device *dev)
 	phydev->drv = NULL;
 
 	return 0;
-}
-
-static void phy_shutdown(struct device *dev)
-{
-	struct phy_device *phydev = to_phy_device(dev);
-
-	if (phydev->state == PHY_READY || !phydev->attached_dev)
-		return;
-
-	phy_disable_interrupts(phydev);
 }
 
 /**
@@ -3180,7 +3172,6 @@ int phy_driver_register(struct phy_driver *new_driver, struct module *owner)
 	new_driver->mdiodrv.driver.bus = &mdio_bus_type;
 	new_driver->mdiodrv.driver.probe = phy_probe;
 	new_driver->mdiodrv.driver.remove = phy_remove;
-	new_driver->mdiodrv.driver.shutdown = phy_shutdown;
 	new_driver->mdiodrv.driver.owner = owner;
 	new_driver->mdiodrv.driver.probe_type = PROBE_FORCE_SYNCHRONOUS;
 
@@ -3252,23 +3243,30 @@ static int __init phy_init(void)
 {
 	int rc;
 
+	ethtool_set_ethtool_phy_ops(&phy_ethtool_phy_ops);
+
 	rc = mdio_bus_init();
 	if (rc)
-		return rc;
+		goto err_ethtool_phy_ops;
 
-	ethtool_set_ethtool_phy_ops(&phy_ethtool_phy_ops);
 	features_init();
 
 	rc = phy_driver_register(&genphy_c45_driver, THIS_MODULE);
 	if (rc)
-		goto err_c45;
+		goto err_mdio_bus;
 
 	rc = phy_driver_register(&genphy_driver, THIS_MODULE);
-	if (rc) {
-		phy_driver_unregister(&genphy_c45_driver);
+	if (rc)
+		goto err_c45;
+
+	return 0;
+
 err_c45:
-		mdio_bus_exit();
-	}
+	phy_driver_unregister(&genphy_c45_driver);
+err_mdio_bus:
+	mdio_bus_exit();
+err_ethtool_phy_ops:
+	ethtool_set_ethtool_phy_ops(NULL);
 
 	return rc;
 }

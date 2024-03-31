@@ -249,7 +249,7 @@ out:
 	return event;
 }
 
-static int create_fd(struct fsnotify_group *group, struct path *path,
+static int create_fd(struct fsnotify_group *group, const struct path *path,
 		     struct file **file)
 {
 	int client_fd;
@@ -619,7 +619,7 @@ static ssize_t copy_event_to_user(struct fsnotify_group *group,
 				  char __user *buf, size_t count)
 {
 	struct fanotify_event_metadata metadata;
-	struct path *path = fanotify_event_path(event);
+	const struct path *path = fanotify_event_path(event);
 	struct fanotify_info *info = fanotify_event_info(event);
 	unsigned int info_mode = FAN_GROUP_FLAG(group, FANOTIFY_INFO_MODES);
 	unsigned int pidfd_mode = info_mode & FAN_REPORT_PIDFD;
@@ -1553,7 +1553,7 @@ static int fanotify_test_fid(struct dentry *dentry)
 }
 
 static int fanotify_events_supported(struct fsnotify_group *group,
-				     struct path *path, __u64 mask,
+				     const struct path *path, __u64 mask,
 				     unsigned int flags)
 {
 	unsigned int mark_type = flags & FANOTIFY_MARK_TYPE_BITS;
@@ -1572,6 +1572,20 @@ static int fanotify_events_supported(struct fsnotify_group *group,
 	 */
 	if (mask & FANOTIFY_PERM_EVENTS &&
 	    path->mnt->mnt_sb->s_type->fs_flags & FS_DISALLOW_NOTIFY_PERM)
+		return -EINVAL;
+
+	/*
+	 * mount and sb marks are not allowed on kernel internal pseudo fs,
+	 * like pipe_mnt, because that would subscribe to events on all the
+	 * anonynous pipes in the system.
+	 *
+	 * SB_NOUSER covers all of the internal pseudo fs whose objects are not
+	 * exposed to user's mount namespace, but there are other SB_KERNMOUNT
+	 * fs, like nsfs, debugfs, for which the value of allowing sb and mount
+	 * mark is questionable. For now we leave them alone.
+	 */
+	if (mark_type != FAN_MARK_INODE &&
+	    path->mnt->mnt_sb->s_flags & SB_NOUSER)
 		return -EINVAL;
 
 	/*

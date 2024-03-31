@@ -278,7 +278,7 @@ static void svm_range_free(struct svm_range *prange, bool update_mem_usage)
 	svm_range_free_dma_mappings(prange);
 
 	if (update_mem_usage && !p->xnack_enabled) {
-		pr_debug("unreserve mem limit: %lld\n", size);
+		pr_debug("unreserve prange 0x%p size: 0x%llx\n", prange, size);
 		amdgpu_amdkfd_unreserve_mem_limit(NULL, size,
 					KFD_IOC_ALLOC_MEM_FLAGS_USERPTR);
 	}
@@ -380,14 +380,9 @@ static void svm_range_bo_release(struct kref *kref)
 		spin_lock(&svm_bo->list_lock);
 	}
 	spin_unlock(&svm_bo->list_lock);
-	if (!dma_fence_is_signaled(&svm_bo->eviction_fence->base)) {
-		/* We're not in the eviction worker.
-		 * Signal the fence and synchronize with any
-		 * pending eviction work.
-		 */
+	if (!dma_fence_is_signaled(&svm_bo->eviction_fence->base))
+		/* We're not in the eviction worker. Signal the fence. */
 		dma_fence_signal(&svm_bo->eviction_fence->base);
-		cancel_work_sync(&svm_bo->eviction_work);
-	}
 	dma_fence_put(&svm_bo->eviction_fence->base);
 	amdgpu_bo_unref(&svm_bo->bo);
 	kfree(svm_bo);
@@ -487,11 +482,11 @@ svm_range_validate_svm_bo(struct amdgpu_device *adev, struct svm_range *prange)
 
 	/* We need a new svm_bo. Spin-loop to wait for concurrent
 	 * svm_range_bo_release to finish removing this range from
-	 * its range list. After this, it is safe to reuse the
-	 * svm_bo pointer and svm_bo_list head.
+	 * its range list and set prange->svm_bo to null. After this,
+	 * it is safe to reuse the svm_bo pointer and svm_bo_list head.
 	 */
-	while (!list_empty_careful(&prange->svm_bo_list))
-		;
+	while (!list_empty_careful(&prange->svm_bo_list) || prange->svm_bo)
+		cond_resched();
 
 	return false;
 }
@@ -541,7 +536,6 @@ svm_range_vram_node_new(struct amdgpu_device *adev, struct svm_range *prange,
 		kfree(svm_bo);
 		return -ESRCH;
 	}
-	svm_bo->svms = prange->svms;
 	svm_bo->eviction_fence =
 		amdgpu_amdkfd_fence_create(dma_fence_context_alloc(1),
 					   mm,
@@ -569,6 +563,15 @@ svm_range_vram_node_new(struct amdgpu_device *adev, struct svm_range *prange,
 	if (r) {
 		pr_debug("failed %d to reserve bo\n", r);
 		goto reserve_bo_failed;
+	}
+
+	if (clear) {
+		r = amdgpu_bo_sync_wait(bo, AMDGPU_FENCE_OWNER_KFD, false);
+		if (r) {
+			pr_debug("failed %d to sync bo\n", r);
+			amdgpu_bo_unreserve(bo);
+			goto reserve_bo_failed;
+		}
 	}
 
 	r = dma_resv_reserve_fences(bo->tbo.base.resv, 1);
@@ -604,8 +607,15 @@ create_bo_failed:
 
 void svm_range_vram_node_free(struct svm_range *prange)
 {
-	svm_range_bo_unref(prange->svm_bo);
-	prange->ttm_res = NULL;
+	/* serialize prange->svm_bo unref */
+	mutex_lock(&prange->lock);
+	/* prange->svm_bo has not been unref */
+	if (prange->ttm_res) {
+		prange->ttm_res = NULL;
+		mutex_unlock(&prange->lock);
+		svm_range_bo_unref(prange->svm_bo);
+	} else
+		mutex_unlock(&prange->lock);
 }
 
 struct amdgpu_device *
@@ -749,7 +759,7 @@ svm_range_apply_attrs(struct kfd_process *p, struct svm_range *prange,
 			prange->flags &= ~attrs[i].value;
 			break;
 		case KFD_IOCTL_SVM_ATTR_GRANULARITY:
-			prange->granularity = attrs[i].value;
+			prange->granularity = min_t(uint32_t, attrs[i].value, 0x3F);
 			break;
 		default:
 			WARN_ONCE(1, "svm_range_check_attrs wasn't called?");
@@ -2231,8 +2241,10 @@ retry:
 		mutex_unlock(&svms->lock);
 		mmap_write_unlock(mm);
 
-		/* Pairs with mmget in svm_range_add_list_work */
-		mmput(mm);
+		/* Pairs with mmget in svm_range_add_list_work. If dropping the
+		 * last mm refcount, schedule release work to avoid circular locking
+		 */
+		mmput_async(mm);
 
 		spin_lock(&svms->deferred_list_lock);
 	}
@@ -2541,6 +2553,7 @@ svm_range_get_range_boundaries(struct kfd_process *p, int64_t addr,
 {
 	struct vm_area_struct *vma;
 	struct interval_tree_node *node;
+	struct rb_node *rb_node;
 	unsigned long start_limit, end_limit;
 
 	vma = find_vma(p->mm, addr << PAGE_SHIFT);
@@ -2563,16 +2576,15 @@ svm_range_get_range_boundaries(struct kfd_process *p, int64_t addr,
 	if (node) {
 		end_limit = min(end_limit, node->start);
 		/* Last range that ends before the fault address */
-		node = container_of(rb_prev(&node->rb),
-				    struct interval_tree_node, rb);
+		rb_node = rb_prev(&node->rb);
 	} else {
 		/* Last range must end before addr because
 		 * there was no range after addr
 		 */
-		node = container_of(rb_last(&p->svms.objects.rb_root),
-				    struct interval_tree_node, rb);
+		rb_node = rb_last(&p->svms.objects.rb_root);
 	}
-	if (node) {
+	if (rb_node) {
+		node = container_of(rb_node, struct interval_tree_node, rb);
 		if (node->last >= addr) {
 			WARN(1, "Overlap with prev node and page fault addr\n");
 			return -EFAULT;
@@ -2914,13 +2926,15 @@ retry_write_locked:
 				 */
 				if (prange->actual_loc)
 					r = svm_migrate_vram_to_ram(prange, mm,
-					   KFD_MIGRATE_TRIGGER_PAGEFAULT_GPU);
+					   KFD_MIGRATE_TRIGGER_PAGEFAULT_GPU,
+					   NULL);
 				else
 					r = 0;
 			}
 		} else {
 			r = svm_migrate_vram_to_ram(prange, mm,
-					KFD_MIGRATE_TRIGGER_PAGEFAULT_GPU);
+					KFD_MIGRATE_TRIGGER_PAGEFAULT_GPU,
+					NULL);
 		}
 		if (r) {
 			pr_debug("failed %d to migrate svms %p [0x%lx 0x%lx]\n",
@@ -2954,6 +2968,64 @@ out:
 		amdgpu_gmc_filter_faults_remove(adev, addr, pasid);
 		r = 0;
 	}
+	return r;
+}
+
+int
+svm_range_switch_xnack_reserve_mem(struct kfd_process *p, bool xnack_enabled)
+{
+	struct svm_range *prange, *pchild;
+	uint64_t reserved_size = 0;
+	uint64_t size;
+	int r = 0;
+
+	pr_debug("switching xnack from %d to %d\n", p->xnack_enabled, xnack_enabled);
+
+	mutex_lock(&p->svms.lock);
+
+	list_for_each_entry(prange, &p->svms.list, list) {
+		svm_range_lock(prange);
+		list_for_each_entry(pchild, &prange->child_list, child_list) {
+			size = (pchild->last - pchild->start + 1) << PAGE_SHIFT;
+			if (xnack_enabled) {
+				amdgpu_amdkfd_unreserve_mem_limit(NULL, size,
+						KFD_IOC_ALLOC_MEM_FLAGS_USERPTR);
+			} else {
+				r = amdgpu_amdkfd_reserve_mem_limit(NULL, size,
+						KFD_IOC_ALLOC_MEM_FLAGS_USERPTR);
+				if (r)
+					goto out_unlock;
+				reserved_size += size;
+			}
+		}
+
+		size = (prange->last - prange->start + 1) << PAGE_SHIFT;
+		if (xnack_enabled) {
+			amdgpu_amdkfd_unreserve_mem_limit(NULL, size,
+						KFD_IOC_ALLOC_MEM_FLAGS_USERPTR);
+		} else {
+			r = amdgpu_amdkfd_reserve_mem_limit(NULL, size,
+						KFD_IOC_ALLOC_MEM_FLAGS_USERPTR);
+			if (r)
+				goto out_unlock;
+			reserved_size += size;
+		}
+out_unlock:
+		svm_range_unlock(prange);
+		if (r)
+			break;
+	}
+
+	if (r)
+		amdgpu_amdkfd_unreserve_mem_limit(NULL, reserved_size,
+						KFD_IOC_ALLOC_MEM_FLAGS_USERPTR);
+	else
+		/* Change xnack mode must be inside svms lock, to avoid race with
+		 * svm_range_deferred_list_work unreserve memory in parallel.
+		 */
+		p->xnack_enabled = xnack_enabled;
+
+	mutex_unlock(&p->svms.lock);
 	return r;
 }
 
@@ -3182,28 +3254,6 @@ out:
 	return best_loc;
 }
 
-/* FIXME: This is a workaround for page locking bug when some pages are
- * invalid during migration to VRAM
- */
-void svm_range_prefault(struct svm_range *prange, struct mm_struct *mm,
-			void *owner)
-{
-	struct hmm_range *hmm_range;
-	int r;
-
-	if (prange->validated_once)
-		return;
-
-	r = amdgpu_hmm_range_get_pages(&prange->notifier, mm, NULL,
-				       prange->start << PAGE_SHIFT,
-				       prange->npages, &hmm_range,
-				       false, true, owner);
-	if (!r) {
-		amdgpu_hmm_range_get_pages_done(hmm_range);
-		prange->validated_once = true;
-	}
-}
-
 /* svm_range_trigger_migration - start page migration if prefetch loc changed
  * @mm: current process mm_struct
  * @prange: svm range structure
@@ -3243,7 +3293,8 @@ svm_range_trigger_migration(struct mm_struct *mm, struct svm_range *prange,
 		return 0;
 
 	if (!best_loc) {
-		r = svm_migrate_vram_to_ram(prange, mm, KFD_MIGRATE_TRIGGER_PREFETCH);
+		r = svm_migrate_vram_to_ram(prange, mm,
+					KFD_MIGRATE_TRIGGER_PREFETCH, NULL);
 		*migrated = !r;
 		return r;
 	}
@@ -3256,13 +3307,14 @@ svm_range_trigger_migration(struct mm_struct *mm, struct svm_range *prange,
 
 int svm_range_schedule_evict_svm_bo(struct amdgpu_amdkfd_fence *fence)
 {
-	if (!fence)
-		return -EINVAL;
-
-	if (dma_fence_is_signaled(&fence->base))
-		return 0;
-
-	if (fence->svm_bo) {
+	/* Dereferencing fence->svm_bo is safe here because the fence hasn't
+	 * signaled yet and we're under the protection of the fence->lock.
+	 * After the fence is signaled in svm_range_bo_release, we cannot get
+	 * here any more.
+	 *
+	 * Reference is dropped in svm_range_evict_svm_bo_worker.
+	 */
+	if (svm_bo_ref_unless_zero(fence->svm_bo)) {
 		WRITE_ONCE(fence->svm_bo->evicting, 1);
 		schedule_work(&fence->svm_bo->eviction_work);
 	}
@@ -3273,21 +3325,17 @@ int svm_range_schedule_evict_svm_bo(struct amdgpu_amdkfd_fence *fence)
 static void svm_range_evict_svm_bo_worker(struct work_struct *work)
 {
 	struct svm_range_bo *svm_bo;
-	struct kfd_process *p;
 	struct mm_struct *mm;
 	int r = 0;
 
 	svm_bo = container_of(work, struct svm_range_bo, eviction_work);
-	if (!svm_bo_ref_unless_zero(svm_bo))
-		return; /* svm_bo was freed while eviction was pending */
 
-	/* svm_range_bo_release destroys this worker thread. So during
-	 * the lifetime of this thread, kfd_process and mm will be valid.
-	 */
-	p = container_of(svm_bo->svms, struct kfd_process, svms);
-	mm = p->mm;
-	if (!mm)
+	if (mmget_not_zero(svm_bo->eviction_fence->mm)) {
+		mm = svm_bo->eviction_fence->mm;
+	} else {
+		svm_range_bo_unref(svm_bo);
 		return;
+	}
 
 	mmap_read_lock(mm);
 	spin_lock(&svm_bo->list_lock);
@@ -3305,9 +3353,8 @@ static void svm_range_evict_svm_bo_worker(struct work_struct *work)
 
 		mutex_lock(&prange->migrate_mutex);
 		do {
-			r = svm_migrate_vram_to_ram(prange,
-						svm_bo->eviction_fence->mm,
-						KFD_MIGRATE_TRIGGER_TTM_EVICTION);
+			r = svm_migrate_vram_to_ram(prange, mm,
+					KFD_MIGRATE_TRIGGER_TTM_EVICTION, NULL);
 		} while (!r && prange->actual_loc && --retries);
 
 		if (!r && prange->actual_loc)
@@ -3324,6 +3371,7 @@ static void svm_range_evict_svm_bo_worker(struct work_struct *work)
 	}
 	spin_unlock(&svm_bo->list_lock);
 	mmap_read_unlock(mm);
+	mmput(mm);
 
 	dma_fence_signal(&svm_bo->eviction_fence->base);
 

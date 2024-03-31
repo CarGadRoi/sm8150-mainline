@@ -177,6 +177,7 @@ int mlx5r_umr_resource_init(struct mlx5_ib_dev *dev)
 
 	sema_init(&dev->umrc.sem, MAX_UMR_WR);
 	mutex_init(&dev->umrc.lock);
+	dev->umrc.state = MLX5_UMR_STATE_ACTIVE;
 
 	return 0;
 
@@ -191,6 +192,8 @@ destroy_pd:
 
 void mlx5r_umr_resource_cleanup(struct mlx5_ib_dev *dev)
 {
+	if (dev->umrc.state == MLX5_UMR_STATE_UNINIT)
+		return;
 	ib_destroy_qp(dev->umrc.qp);
 	ib_free_cq(dev->umrc.cq);
 	ib_dealloc_pd(dev->umrc.pd);
@@ -377,6 +380,9 @@ static void mlx5r_umr_set_access_flags(struct mlx5_ib_dev *dev,
 				       struct mlx5_mkey_seg *seg,
 				       unsigned int access_flags)
 {
+	bool ro_read = (access_flags & IB_ACCESS_RELAXED_ORDERING) &&
+		       pcie_relaxed_ordering_enabled(dev->mdev->pdev);
+
 	MLX5_SET(mkc, seg, a, !!(access_flags & IB_ACCESS_REMOTE_ATOMIC));
 	MLX5_SET(mkc, seg, rw, !!(access_flags & IB_ACCESS_REMOTE_WRITE));
 	MLX5_SET(mkc, seg, rr, !!(access_flags & IB_ACCESS_REMOTE_READ));
@@ -384,8 +390,7 @@ static void mlx5r_umr_set_access_flags(struct mlx5_ib_dev *dev,
 	MLX5_SET(mkc, seg, lr, 1);
 	MLX5_SET(mkc, seg, relaxed_ordering_write,
 		 !!(access_flags & IB_ACCESS_RELAXED_ORDERING));
-	MLX5_SET(mkc, seg, relaxed_ordering_read,
-		 !!(access_flags & IB_ACCESS_RELAXED_ORDERING));
+	MLX5_SET(mkc, seg, relaxed_ordering_read, ro_read);
 }
 
 int mlx5r_umr_rereg_pd_access(struct mlx5_ib_mr *mr, struct ib_pd *pd,

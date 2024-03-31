@@ -565,7 +565,7 @@ struct mmc_host *mmc_alloc_host(int extra, struct device *dev)
 	spin_lock_init(&host->lock);
 	init_waitqueue_head(&host->wq);
 	INIT_DELAYED_WORK(&host->detect, mmc_rescan);
-	INIT_DELAYED_WORK(&host->sdio_irq_work, sdio_irq_work);
+	INIT_WORK(&host->sdio_irq_work, sdio_irq_work);
 	timer_setup(&host->retune_timer, mmc_retune_timer, 0);
 
 	/*
@@ -670,6 +670,7 @@ EXPORT_SYMBOL(mmc_remove_host);
  */
 void mmc_free_host(struct mmc_host *host)
 {
+	cancel_delayed_work_sync(&host->detect);
 	mmc_pwrseq_free(host);
 	put_device(&host->class_dev);
 }

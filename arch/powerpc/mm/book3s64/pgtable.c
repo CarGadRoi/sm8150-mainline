@@ -463,6 +463,7 @@ void ptep_modify_prot_commit(struct vm_area_struct *vma, unsigned long addr,
 	set_pte_at(vma->vm_mm, addr, ptep, pte);
 }
 
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 /*
  * For hash translation mode, we use the deposited table to store hash slot
  * information and they are stored at PTRS_PER_PMD offset from related pmd
@@ -484,6 +485,7 @@ int pmd_move_must_withdraw(struct spinlock *new_pmd_ptl,
 
 	return true;
 }
+#endif
 
 /*
  * Does the CPU support tlbie?
@@ -553,8 +555,15 @@ EXPORT_SYMBOL_GPL(memremap_compat_align);
 
 pgprot_t vm_get_page_prot(unsigned long vm_flags)
 {
-	unsigned long prot = pgprot_val(protection_map[vm_flags &
-					(VM_READ|VM_WRITE|VM_EXEC|VM_SHARED)]);
+	unsigned long prot;
+
+	/* Radix supports execute-only, but protection_map maps X -> RX */
+	if (radix_enabled() && ((vm_flags & VM_ACCESS_FLAGS) == VM_EXEC)) {
+		prot = pgprot_val(PAGE_EXECONLY);
+	} else {
+		prot = pgprot_val(protection_map[vm_flags &
+						 (VM_ACCESS_FLAGS | VM_SHARED)]);
+	}
 
 	if (vm_flags & VM_SAO)
 		prot |= _PAGE_SAO;

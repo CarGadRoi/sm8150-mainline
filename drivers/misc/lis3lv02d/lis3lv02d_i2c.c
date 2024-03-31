@@ -151,6 +151,7 @@ static int lis3lv02d_i2c_probe(struct i2c_client *client,
 	lis3_dev.init	  = lis3_i2c_init;
 	lis3_dev.read	  = lis3_i2c_read;
 	lis3_dev.write	  = lis3_i2c_write;
+	lis3_dev.reg_ctrl = lis3_reg_ctrl;
 	lis3_dev.irq	  = client->irq;
 	lis3_dev.ac	  = lis3lv02d_axis_map;
 	lis3_dev.pm_dev	  = &client->dev;
@@ -177,7 +178,7 @@ fail:
 	return ret;
 }
 
-static int lis3lv02d_i2c_remove(struct i2c_client *client)
+static void lis3lv02d_i2c_remove(struct i2c_client *client)
 {
 	struct lis3lv02d *lis3 = i2c_get_clientdata(client);
 	struct lis3lv02d_platform_data *pdata = client->dev.platform_data;
@@ -190,7 +191,6 @@ static int lis3lv02d_i2c_remove(struct i2c_client *client)
 
 	regulator_bulk_free(ARRAY_SIZE(lis3->regulators),
 			    lis3_dev.regulators);
-	return 0;
 }
 
 #ifdef CONFIG_PM_SLEEP

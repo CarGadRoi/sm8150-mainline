@@ -61,6 +61,14 @@ struct dentry;
 						 RKISP1_CIF_ISP_EXP_END |	\
 						 RKISP1_CIF_ISP_HIST_MEASURE_RDY)
 
+/* IRQ lines */
+enum rkisp1_irq_line {
+	RKISP1_IRQ_ISP = 0,
+	RKISP1_IRQ_MI,
+	RKISP1_IRQ_MIPI,
+	RKISP1_NUM_IRQS,
+};
+
 /* enum for the resizer pads */
 enum rkisp1_rsz_pad {
 	RKISP1_RSZ_PAD_SINK,
@@ -378,6 +386,7 @@ struct rkisp1_params {
 	struct v4l2_format vdev_fmt;
 
 	enum v4l2_quantization quantization;
+	enum v4l2_ycbcr_encoding ycbcr_encoding;
 	enum rkisp1_fmt_raw_pat_type raw_type;
 };
 
@@ -440,7 +449,6 @@ struct rkisp1_debug {
  * struct rkisp1_device - ISP platform device
  *
  * @base_addr:	   base register address
- * @irq:	   the irq number
  * @dev:	   a pointer to the struct device
  * @clk_size:	   number of clocks
  * @clks:	   array of clocks
@@ -458,6 +466,8 @@ struct rkisp1_debug {
  * @stream_lock:   serializes {start/stop}_streaming callbacks between the capture devices.
  * @debug:	   debug params to be exposed on debugfs
  * @info:	   version-specific ISP information
+ * @irqs:          IRQ line numbers
+ * @irqs_enabled:  the hardware is enabled and can cause interrupts
  */
 struct rkisp1_device {
 	void __iomem *base_addr;
@@ -478,6 +488,8 @@ struct rkisp1_device {
 	struct mutex stream_lock; /* serialize {start/stop}_streaming cb between capture devices */
 	struct rkisp1_debug debug;
 	const struct rkisp1_info *info;
+	int irqs[RKISP1_NUM_IRQS];
+	bool irqs_enabled;
 };
 
 /*
@@ -556,17 +568,32 @@ void rkisp1_sd_adjust_crop(struct v4l2_rect *crop,
  */
 const struct rkisp1_mbus_info *rkisp1_mbus_info_get_by_code(u32 mbus_code);
 
-/* rkisp1_params_configure - configure the params when stream starts.
- *			     This function is called by the isp entity upon stream starts.
- *			     The function applies the initial configuration of the parameters.
+/*
+ * rkisp1_params_pre_configure - Configure the params before stream start
  *
- * @params:	  pointer to rkisp1_params.
+ * @params:	  pointer to rkisp1_params
  * @bayer_pat:	  the bayer pattern on the isp video sink pad
  * @quantization: the quantization configured on the isp's src pad
+ * @ycbcr_encoding: the ycbcr_encoding configured on the isp's src pad
+ *
+ * This function is called by the ISP entity just before the ISP gets started.
+ * It applies the initial ISP parameters from the first params buffer, but
+ * skips LSC as it needs to be configured after the ISP is started.
  */
-void rkisp1_params_configure(struct rkisp1_params *params,
-			     enum rkisp1_fmt_raw_pat_type bayer_pat,
-			     enum v4l2_quantization quantization);
+void rkisp1_params_pre_configure(struct rkisp1_params *params,
+				 enum rkisp1_fmt_raw_pat_type bayer_pat,
+				 enum v4l2_quantization quantization,
+				 enum v4l2_ycbcr_encoding ycbcr_encoding);
+
+/*
+ * rkisp1_params_post_configure - Configure the params after stream start
+ *
+ * @params:	  pointer to rkisp1_params
+ *
+ * This function is called by the ISP entity just after the ISP gets started.
+ * It applies the initial ISP LSC parameters from the first params buffer.
+ */
+void rkisp1_params_post_configure(struct rkisp1_params *params);
 
 /* rkisp1_params_disable - disable all parameters.
  *			   This function is called by the isp entity upon stream start

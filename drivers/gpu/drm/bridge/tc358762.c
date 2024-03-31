@@ -216,7 +216,7 @@ static int tc358762_probe(struct mipi_dsi_device *dsi)
 	dsi->lanes = 1;
 	dsi->format = MIPI_DSI_FMT_RGB888;
 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_SYNC_PULSE |
-			  MIPI_DSI_MODE_LPM;
+			  MIPI_DSI_MODE_LPM | MIPI_DSI_MODE_VIDEO_HSE;
 
 	ret = tc358762_parse_dt(ctx);
 	if (ret < 0)
@@ -241,14 +241,12 @@ static int tc358762_probe(struct mipi_dsi_device *dsi)
 	return ret;
 }
 
-static int tc358762_remove(struct mipi_dsi_device *dsi)
+static void tc358762_remove(struct mipi_dsi_device *dsi)
 {
 	struct tc358762 *ctx = mipi_dsi_get_drvdata(dsi);
 
 	mipi_dsi_detach(dsi);
 	drm_bridge_remove(&ctx->bridge);
-
-	return 0;
 }
 
 static const struct of_device_id tc358762_of_match[] = {

@@ -135,7 +135,7 @@
 /* Link Down indication in WoWL mode: */
 #define BRCMF_WOWL_LINKDOWN		(1 << 31)
 
-#define BRCMF_WOWL_MAXPATTERNS		8
+#define BRCMF_WOWL_MAXPATTERNS		16
 #define BRCMF_WOWL_MAXPATTERNSIZE	128
 
 #define BRCMF_COUNTRY_BUF_SZ		4
@@ -383,7 +383,12 @@ struct brcmf_scan_params_le {
 				 * fixed parameter portion is assumed, otherwise
 				 * ssid in the fixed portion is ignored
 				 */
-	__le16 channel_list[1];	/* list of chanspecs */
+	union {
+		__le16 padding;	/* Reserve space for at least 1 entry for abort
+				 * which uses an on stack brcmf_scan_params_le
+				 */
+		DECLARE_FLEX_ARRAY(__le16, channel_list);	/* chanspecs */
+	};
 };
 
 struct brcmf_scan_results {

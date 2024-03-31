@@ -1978,9 +1978,6 @@ static int dpaa2_switch_port_attr_set_event(struct net_device *netdev,
 	return notifier_from_errno(err);
 }
 
-static struct notifier_block dpaa2_switch_port_switchdev_nb;
-static struct notifier_block dpaa2_switch_port_switchdev_blocking_nb;
-
 static int dpaa2_switch_port_bridge_join(struct net_device *netdev,
 					 struct net_device *upper_dev,
 					 struct netlink_ext_ack *extack)
@@ -2023,9 +2020,7 @@ static int dpaa2_switch_port_bridge_join(struct net_device *netdev,
 		goto err_egress_flood;
 
 	err = switchdev_bridge_port_offload(netdev, netdev, NULL,
-					    &dpaa2_switch_port_switchdev_nb,
-					    &dpaa2_switch_port_switchdev_blocking_nb,
-					    false, extack);
+					    NULL, NULL, false, extack);
 	if (err)
 		goto err_switchdev_offload;
 
@@ -2059,9 +2054,7 @@ static int dpaa2_switch_port_restore_rxvlan(struct net_device *vdev, int vid, vo
 
 static void dpaa2_switch_port_pre_bridge_leave(struct net_device *netdev)
 {
-	switchdev_bridge_port_unoffload(netdev, NULL,
-					&dpaa2_switch_port_switchdev_nb,
-					&dpaa2_switch_port_switchdev_blocking_nb);
+	switchdev_bridge_port_unoffload(netdev, NULL, NULL, NULL);
 }
 
 static int dpaa2_switch_port_bridge_leave(struct net_device *netdev)
@@ -3373,9 +3366,8 @@ static int dpaa2_switch_probe(struct fsl_mc_device *sw_dev)
 	 * different queues for each switch ports.
 	 */
 	for (i = 0; i < DPAA2_SWITCH_RX_NUM_FQS; i++)
-		netif_napi_add(ethsw->ports[0]->netdev,
-			       &ethsw->fq[i].napi, dpaa2_switch_poll,
-			       NAPI_POLL_WEIGHT);
+		netif_napi_add(ethsw->ports[0]->netdev, &ethsw->fq[i].napi,
+			       dpaa2_switch_poll);
 
 	/* Setup IRQs */
 	err = dpaa2_switch_setup_irqs(sw_dev);

@@ -231,6 +231,9 @@ static void *trie_lookup_elem(struct bpf_map *map, void *_key)
 	struct lpm_trie_node *node, *found = NULL;
 	struct bpf_lpm_trie_key *key = _key;
 
+	if (key->prefixlen > trie->max_prefixlen)
+		return NULL;
+
 	/* Start walking the trie from the root node ... */
 
 	for (node = rcu_dereference_check(trie->root, rcu_read_lock_bh_held());
@@ -558,7 +561,7 @@ static struct bpf_map *trie_alloc(union bpf_attr *attr)
 	    attr->value_size > LPM_VAL_SIZE_MAX)
 		return ERR_PTR(-EINVAL);
 
-	trie = kzalloc(sizeof(*trie), GFP_USER | __GFP_NOWARN | __GFP_ACCOUNT);
+	trie = bpf_map_area_alloc(sizeof(*trie), NUMA_NO_NODE);
 	if (!trie)
 		return ERR_PTR(-ENOMEM);
 
@@ -609,7 +612,7 @@ static void trie_free(struct bpf_map *map)
 	}
 
 out:
-	kfree(trie);
+	bpf_map_area_free(trie);
 }
 
 static int trie_get_next_key(struct bpf_map *map, void *_key, void *_next_key)

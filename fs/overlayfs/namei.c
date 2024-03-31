@@ -26,7 +26,7 @@ struct ovl_lookup_data {
 	bool metacopy;
 };
 
-static int ovl_check_redirect(struct path *path, struct ovl_lookup_data *d,
+static int ovl_check_redirect(const struct path *path, struct ovl_lookup_data *d,
 			      size_t prelen, const char *post)
 {
 	int res;
@@ -194,7 +194,7 @@ struct dentry *ovl_decode_real_fh(struct ovl_fs *ofs, struct ovl_fh *fh,
 	return real;
 }
 
-static bool ovl_is_opaquedir(struct ovl_fs *ofs, struct path *path)
+static bool ovl_is_opaquedir(struct ovl_fs *ofs, const struct path *path)
 {
 	return ovl_path_check_dir_xattr(ofs, path, OVL_XATTR_OPAQUE);
 }
@@ -1116,8 +1116,7 @@ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
 			ovl_set_flag(OVL_UPPERDATA, inode);
 	}
 
-	ovl_dentry_update_reval(dentry, upperdentry,
-			DCACHE_OP_REVALIDATE | DCACHE_OP_WEAK_REVALIDATE);
+	ovl_dentry_init_reval(dentry, upperdentry);
 
 	revert_creds(old_cred);
 	if (origin_path) {

@@ -99,8 +99,8 @@
 #include <linux/serial.h>
 #include <linux/ratelimit.h>
 #include <linux/compat.h>
-
 #include <linux/uaccess.h>
+#include <linux/termios_internal.h>
 
 #include <linux/kbd_kern.h>
 #include <linux/vt_kern.h>
@@ -170,7 +170,6 @@ static void free_tty_struct(struct tty_struct *tty)
 	tty_ldisc_deinit(tty);
 	put_device(tty->dev);
 	kvfree(tty->write_buf);
-	tty->magic = 0xDEADDEAD;
 	kfree(tty);
 }
 
@@ -262,11 +261,6 @@ static int tty_paranoia_check(struct tty_struct *tty, struct inode *inode,
 #ifdef TTY_PARANOIA_CHECK
 	if (!tty) {
 		pr_warn("(%d:%d): %s: NULL tty\n",
-			imajor(inode), iminor(inode), routine);
-		return 1;
-	}
-	if (tty->magic != TTY_MAGIC) {
-		pr_warn("(%d:%d): %s: bad magic number\n",
 			imajor(inode), iminor(inode), routine);
 		return 1;
 	}
@@ -939,13 +933,13 @@ static ssize_t tty_read(struct kiocb *iocb, struct iov_iter *to)
 	return i;
 }
 
-static void tty_write_unlock(struct tty_struct *tty)
+void tty_write_unlock(struct tty_struct *tty)
 {
 	mutex_unlock(&tty->atomic_write_lock);
 	wake_up_interruptible_poll(&tty->write_wait, EPOLLOUT);
 }
 
-static int tty_write_lock(struct tty_struct *tty, int ndelay)
+int tty_write_lock(struct tty_struct *tty, bool ndelay)
 {
 	if (!mutex_trylock(&tty->atomic_write_lock)) {
 		if (ndelay)
@@ -1159,7 +1153,7 @@ int tty_send_xchar(struct tty_struct *tty, char ch)
 		return 0;
 	}
 
-	if (tty_write_lock(tty, 0) < 0)
+	if (tty_write_lock(tty, false) < 0)
 		return -ERESTARTSYS;
 
 	down_read(&tty->termios_rwsem);
@@ -1230,14 +1224,16 @@ static struct tty_struct *tty_driver_lookup_tty(struct tty_driver *driver,
 {
 	struct tty_struct *tty;
 
-	if (driver->ops->lookup)
+	if (driver->ops->lookup) {
 		if (!file)
 			tty = ERR_PTR(-EIO);
 		else
 			tty = driver->ops->lookup(driver, file, idx);
-	else
+	} else {
+		if (idx >= driver->num)
+			return ERR_PTR(-EINVAL);
 		tty = driver->ttys[idx];
-
+	}
 	if (!IS_ERR(tty))
 		tty_kref_get(tty);
 	return tty;
@@ -1533,7 +1529,6 @@ static void release_one_tty(struct work_struct *work)
 	if (tty->ops->cleanup)
 		tty->ops->cleanup(tty);
 
-	tty->magic = 0;
 	tty_driver_kref_put(driver);
 	module_put(owner);
 
@@ -2477,22 +2472,25 @@ static int send_break(struct tty_struct *tty, unsigned int duration)
 		return 0;
 
 	if (tty->driver->flags & TTY_DRIVER_HARDWARE_BREAK)
-		retval = tty->ops->break_ctl(tty, duration);
-	else {
-		/* Do the work ourselves */
-		if (tty_write_lock(tty, 0) < 0)
-			return -EINTR;
-		retval = tty->ops->break_ctl(tty, -1);
-		if (retval)
-			goto out;
-		if (!signal_pending(current))
-			msleep_interruptible(duration);
+		return tty->ops->break_ctl(tty, duration);
+
+	/* Do the work ourselves */
+	if (tty_write_lock(tty, false) < 0)
+		return -EINTR;
+
+	retval = tty->ops->break_ctl(tty, -1);
+	if (!retval) {
+		msleep_interruptible(duration);
 		retval = tty->ops->break_ctl(tty, 0);
-out:
-		tty_write_unlock(tty);
-		if (signal_pending(current))
-			retval = -EINTR;
+	} else if (retval == -EOPNOTSUPP) {
+		/* some drivers can tell only dynamically */
+		retval = 0;
 	}
+	tty_write_unlock(tty);
+
+	if (signal_pending(current))
+		retval = -EINTR;
+
 	return retval;
 }
 
@@ -3093,7 +3091,6 @@ struct tty_struct *alloc_tty_struct(struct tty_driver *driver, int idx)
 		return NULL;
 
 	kref_init(&tty->kref);
-	tty->magic = TTY_MAGIC;
 	if (tty_ldisc_init(tty)) {
 		kfree(tty);
 		return NULL;
@@ -3329,7 +3326,6 @@ struct tty_driver *__tty_alloc_driver(unsigned int lines, struct module *owner,
 		return ERR_PTR(-ENOMEM);
 
 	kref_init(&driver->kref);
-	driver->magic = TTY_DRIVER_MAGIC;
 	driver->num = lines;
 	driver->owner = owner;
 	driver->flags = flags;

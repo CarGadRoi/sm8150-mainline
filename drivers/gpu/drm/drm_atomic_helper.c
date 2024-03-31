@@ -38,7 +38,6 @@
 #include <drm/drm_drv.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_atomic_helper.h>
-#include <drm/drm_plane_helper.h>
 #include <drm/drm_print.h>
 #include <drm/drm_self_refresh_helper.h>
 #include <drm/drm_vblank.h>
@@ -291,7 +290,8 @@ static int
 update_connector_routing(struct drm_atomic_state *state,
 			 struct drm_connector *connector,
 			 struct drm_connector_state *old_connector_state,
-			 struct drm_connector_state *new_connector_state)
+			 struct drm_connector_state *new_connector_state,
+			 bool added_by_user)
 {
 	const struct drm_connector_helper_funcs *funcs;
 	struct drm_encoder *new_encoder;
@@ -340,9 +340,13 @@ update_connector_routing(struct drm_atomic_state *state,
 	 * there's a chance the connector may have been destroyed during the
 	 * process, but it's better to ignore that then cause
 	 * drm_atomic_helper_resume() to fail.
+	 *
+	 * Last, we want to ignore connector registration when the connector
+	 * was not pulled in the atomic state by user-space (ie, was pulled
+	 * in by the driver, e.g. when updating a DP-MST stream).
 	 */
 	if (!state->duplicated && drm_connector_is_unregistered(connector) &&
-	    crtc_state->active) {
+	    added_by_user && crtc_state->active) {
 		drm_dbg_atomic(connector->dev,
 			       "[CONNECTOR:%d:%s] is not registered\n",
 			       connector->base.id, connector->name);
@@ -621,7 +625,10 @@ drm_atomic_helper_check_modeset(struct drm_device *dev,
 	struct drm_connector *connector;
 	struct drm_connector_state *old_connector_state, *new_connector_state;
 	int i, ret;
-	unsigned int connectors_mask = 0;
+	unsigned int connectors_mask = 0, user_connectors_mask = 0;
+
+	for_each_oldnew_connector_in_state(state, connector, old_connector_state, new_connector_state, i)
+		user_connectors_mask |= BIT(i);
 
 	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
 		bool has_connectors =
@@ -686,7 +693,8 @@ drm_atomic_helper_check_modeset(struct drm_device *dev,
 		 */
 		ret = update_connector_routing(state, connector,
 					       old_connector_state,
-					       new_connector_state);
+					       new_connector_state,
+					       BIT(i) & user_connectors_mask);
 		if (ret)
 			return ret;
 		if (old_connector_state->crtc) {
@@ -703,8 +711,12 @@ drm_atomic_helper_check_modeset(struct drm_device *dev,
 
 		if (funcs->atomic_check)
 			ret = funcs->atomic_check(connector, state);
-		if (ret)
+		if (ret) {
+			drm_dbg_atomic(dev,
+				       "[CONNECTOR:%d:%s] driver check failed\n",
+				       connector->base.id, connector->name);
 			return ret;
+		}
 
 		connectors_mask |= BIT(i);
 	}
@@ -746,8 +758,12 @@ drm_atomic_helper_check_modeset(struct drm_device *dev,
 
 		if (funcs->atomic_check)
 			ret = funcs->atomic_check(connector, state);
-		if (ret)
+		if (ret) {
+			drm_dbg_atomic(dev,
+				       "[CONNECTOR:%d:%s] driver check failed\n",
+				       connector->base.id, connector->name);
 			return ret;
+		}
 	}
 
 	/*
@@ -777,6 +793,45 @@ drm_atomic_helper_check_modeset(struct drm_device *dev,
 	return mode_fixup(state);
 }
 EXPORT_SYMBOL(drm_atomic_helper_check_modeset);
+
+/**
+ * drm_atomic_helper_check_wb_encoder_state() - Check writeback encoder state
+ * @encoder: encoder state to check
+ * @conn_state: connector state to check
+ *
+ * Checks if the writeback connector state is valid, and returns an error if it
+ * isn't.
+ *
+ * RETURNS:
+ * Zero for success or -errno
+ */
+int
+drm_atomic_helper_check_wb_encoder_state(struct drm_encoder *encoder,
+					 struct drm_connector_state *conn_state)
+{
+	struct drm_writeback_job *wb_job = conn_state->writeback_job;
+	struct drm_property_blob *pixel_format_blob;
+	struct drm_framebuffer *fb;
+	size_t i, nformats;
+	u32 *formats;
+
+	if (!wb_job || !wb_job->fb)
+		return 0;
+
+	pixel_format_blob = wb_job->connector->pixel_formats_blob_ptr;
+	nformats = pixel_format_blob->length / sizeof(u32);
+	formats = pixel_format_blob->data;
+	fb = wb_job->fb;
+
+	for (i = 0; i < nformats; i++)
+		if (fb->format->format == formats[i])
+			return 0;
+
+	drm_dbg_kms(encoder->dev, "Invalid pixel format %p4cc\n", &fb->format->format);
+
+	return -EINVAL;
+}
+EXPORT_SYMBOL(drm_atomic_helper_check_wb_encoder_state);
 
 /**
  * drm_atomic_helper_check_plane_state() - Check plane state for validity
@@ -899,7 +954,6 @@ int drm_atomic_helper_check_crtc_state(struct drm_crtc_state *crtc_state,
 				       bool can_disable_primary_planes)
 {
 	struct drm_device *dev = crtc_state->crtc->dev;
-	struct drm_atomic_state *state = crtc_state->state;
 
 	if (!crtc_state->enable)
 		return 0;
@@ -910,14 +964,7 @@ int drm_atomic_helper_check_crtc_state(struct drm_crtc_state *crtc_state,
 		struct drm_plane *plane;
 
 		drm_for_each_plane_mask(plane, dev, crtc_state->plane_mask) {
-			struct drm_plane_state *plane_state;
-
-			if (plane->type != DRM_PLANE_TYPE_PRIMARY)
-				continue;
-			plane_state = drm_atomic_get_plane_state(state, plane);
-			if (IS_ERR(plane_state))
-				return PTR_ERR(plane_state);
-			if (plane_state->fb && plane_state->crtc) {
+			if (plane->type == DRM_PLANE_TYPE_PRIMARY) {
 				has_primary_plane = true;
 				break;
 			}
@@ -1187,7 +1234,16 @@ disable_outputs(struct drm_device *dev, struct drm_atomic_state *old_state)
 			continue;
 
 		ret = drm_crtc_vblank_get(crtc);
-		WARN_ONCE(ret != -EINVAL, "driver forgot to call drm_crtc_vblank_off()\n");
+		/*
+		 * Self-refresh is not a true "disable"; ensure vblank remains
+		 * enabled.
+		 */
+		if (new_crtc_state->self_refresh_active)
+			WARN_ONCE(ret != 0,
+				  "driver disabled vblank in self-refresh\n");
+		else
+			WARN_ONCE(ret != -EINVAL,
+				  "driver forgot to call drm_crtc_vblank_off()\n");
 		if (ret == 0)
 			drm_crtc_vblank_put(crtc);
 	}
@@ -1789,7 +1845,7 @@ int drm_atomic_helper_async_check(struct drm_device *dev,
 	struct drm_plane_state *old_plane_state = NULL;
 	struct drm_plane_state *new_plane_state = NULL;
 	const struct drm_plane_helper_funcs *funcs;
-	int i, n_planes = 0;
+	int i, ret, n_planes = 0;
 
 	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
 		if (drm_atomic_crtc_needs_modeset(crtc_state))
@@ -1800,19 +1856,34 @@ int drm_atomic_helper_async_check(struct drm_device *dev,
 		n_planes++;
 
 	/* FIXME: we support only single plane updates for now */
-	if (n_planes != 1)
+	if (n_planes != 1) {
+		drm_dbg_atomic(dev,
+			       "only single plane async updates are supported\n");
 		return -EINVAL;
+	}
 
 	if (!new_plane_state->crtc ||
-	    old_plane_state->crtc != new_plane_state->crtc)
+	    old_plane_state->crtc != new_plane_state->crtc) {
+		drm_dbg_atomic(dev,
+			       "[PLANE:%d:%s] async update cannot change CRTC\n",
+			       plane->base.id, plane->name);
 		return -EINVAL;
+	}
 
 	funcs = plane->helper_private;
-	if (!funcs->atomic_async_update)
+	if (!funcs->atomic_async_update) {
+		drm_dbg_atomic(dev,
+			       "[PLANE:%d:%s] driver does not support async updates\n",
+			       plane->base.id, plane->name);
 		return -EINVAL;
+	}
 
-	if (new_plane_state->fence)
+	if (new_plane_state->fence) {
+		drm_dbg_atomic(dev,
+			       "[PLANE:%d:%s] missing fence for async update\n",
+			       plane->base.id, plane->name);
 		return -EINVAL;
+	}
 
 	/*
 	 * Don't do an async update if there is an outstanding commit modifying
@@ -1827,7 +1898,12 @@ int drm_atomic_helper_async_check(struct drm_device *dev,
 		return -EBUSY;
 	}
 
-	return funcs->atomic_async_check(plane, state);
+	ret = funcs->atomic_async_check(plane, state);
+	if (ret != 0)
+		drm_dbg_atomic(dev,
+			       "[PLANE:%d:%s] driver async check failed\n",
+			       plane->base.id, plane->name);
+	return ret;
 }
 EXPORT_SYMBOL(drm_atomic_helper_async_check);
 

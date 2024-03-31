@@ -109,20 +109,6 @@ def to_cmdfile(path):
     return os.path.join(dir, '.' + base + '.cmd')
 
 
-def cmdfiles_for_o(obj):
-    """Generate the iterator of .cmd files associated with the object
-
-    Yield the .cmd file used to build the given object
-
-    Args:
-        obj: The object path
-
-    Yields:
-        The path to .cmd file
-    """
-    yield to_cmdfile(obj)
-
-
 def cmdfiles_for_a(archive, ar):
     """Generate the iterator of .cmd files associated with the archive.
 
@@ -184,7 +170,7 @@ def process_line(root_directory, command_prefix, file_path):
     # escape the pound sign '#', either as '\#' or '$(pound)' (depending on the
     # kernel version). The compile_commands.json file is not interepreted
     # by Make, so this code replaces the escaped version with '#'.
-    prefix = command_prefix.replace('\#', '#').replace('$(pound)', '#')
+    prefix = command_prefix.replace(r'\#', '#').replace('$(pound)', '#')
 
     # Use os.path.abspath() to normalize the path resolving '.' and '..' .
     abs_path = os.path.abspath(os.path.join(root_directory, file_path))
@@ -211,13 +197,10 @@ def main():
     for path in paths:
         # If 'path' is a directory, handle all .cmd files under it.
         # Otherwise, handle .cmd files associated with the file.
-        # Most of built-in objects are linked via archives (built-in.a or lib.a)
-        # but some objects are linked to vmlinux directly.
+        # built-in objects are linked via vmlinux.a
         # Modules are listed in modules.order.
         if os.path.isdir(path):
             cmdfiles = cmdfiles_in_dir(path)
-        elif path.endswith('.o'):
-            cmdfiles = cmdfiles_for_o(path)
         elif path.endswith('.a'):
             cmdfiles = cmdfiles_for_a(path, ar)
         elif path.endswith('modules.order'):

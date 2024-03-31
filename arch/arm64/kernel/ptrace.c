@@ -121,7 +121,7 @@ static bool regs_within_kernel_stack(struct pt_regs *regs, unsigned long addr)
 {
 	return ((addr & ~(THREAD_SIZE - 1))  ==
 		(kernel_stack_pointer(regs) & ~(THREAD_SIZE - 1))) ||
-		on_irq_stack(addr, sizeof(unsigned long), NULL);
+		on_irq_stack(addr, sizeof(unsigned long));
 }
 
 /**
@@ -666,10 +666,18 @@ static int fpr_set(struct task_struct *target, const struct user_regset *regset,
 static int tls_get(struct task_struct *target, const struct user_regset *regset,
 		   struct membuf to)
 {
+	int ret;
+
 	if (target == current)
 		tls_preserve_current_state();
 
-	return membuf_store(&to, target->thread.uw.tp_value);
+	ret = membuf_store(&to, target->thread.uw.tp_value);
+	if (system_supports_tpidr2())
+		ret = membuf_store(&to, target->thread.tpidr2_el0);
+	else
+		ret = membuf_zero(&to, sizeof(u64));
+
+	return ret;
 }
 
 static int tls_set(struct task_struct *target, const struct user_regset *regset,
@@ -677,13 +685,20 @@ static int tls_set(struct task_struct *target, const struct user_regset *regset,
 		   const void *kbuf, const void __user *ubuf)
 {
 	int ret;
-	unsigned long tls = target->thread.uw.tp_value;
+	unsigned long tls[2];
 
-	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &tls, 0, -1);
+	tls[0] = target->thread.uw.tp_value;
+	if (system_supports_sme())
+		tls[1] = target->thread.tpidr2_el0;
+
+	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, tls, 0, count);
 	if (ret)
 		return ret;
 
-	target->thread.uw.tp_value = tls;
+	target->thread.uw.tp_value = tls[0];
+	if (system_supports_sme())
+		target->thread.tpidr2_el0 = tls[1];
+
 	return ret;
 }
 
@@ -871,10 +886,18 @@ static int sve_set_common(struct task_struct *target,
 			break;
 		case ARM64_VEC_SME:
 			target->thread.svcr |= SVCR_SM_MASK;
+
+			/*
+			 * Disable traps and ensure there is SME storage but
+			 * preserve any currently set values in ZA/ZT.
+			 */
+			sme_alloc(target, false);
+			set_tsk_thread_flag(target, TIF_SME);
 			break;
 		default:
 			WARN_ON_ONCE(1);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto out;
 		}
 
 		/*
@@ -882,7 +905,7 @@ static int sve_set_common(struct task_struct *target,
 		 * state and ensure there's storage.
 		 */
 		if (target->thread.svcr != old_svcr)
-			sve_alloc(target);
+			sve_alloc(target, true);
 	}
 
 	/* Registers: FPSIMD-only case */
@@ -912,7 +935,7 @@ static int sve_set_common(struct task_struct *target,
 		goto out;
 	}
 
-	sve_alloc(target);
+	sve_alloc(target, true);
 	if (!target->thread.sve_state) {
 		ret = -ENOMEM;
 		clear_tsk_thread_flag(target, TIF_SVE);
@@ -922,11 +945,13 @@ static int sve_set_common(struct task_struct *target,
 	/*
 	 * Ensure target->thread.sve_state is up to date with target's
 	 * FPSIMD regs, so that a short copyin leaves trailing
-	 * registers unmodified.  Always enable SVE even if going into
-	 * streaming mode.
+	 * registers unmodified.  Only enable SVE if we are
+	 * configuring normal SVE, a system with streaming SVE may not
+	 * have normal SVE.
 	 */
 	fpsimd_sync_to_sve(target);
-	set_tsk_thread_flag(target, TIF_SVE);
+	if (type == ARM64_VEC_SVE)
+		set_tsk_thread_flag(target, TIF_SVE);
 
 	BUILD_BUG_ON(SVE_PT_SVE_OFFSET != sizeof(header));
 	start = SVE_PT_SVE_OFFSET;
@@ -1082,19 +1107,17 @@ static int za_set(struct task_struct *target,
 
 	/* Ensure there is some SVE storage for streaming mode */
 	if (!target->thread.sve_state) {
-		sve_alloc(target);
+		sve_alloc(target, false);
 		if (!target->thread.sve_state) {
-			clear_thread_flag(TIF_SME);
 			ret = -ENOMEM;
 			goto out;
 		}
 	}
 
 	/* Allocate/reinit ZA storage */
-	sme_alloc(target);
+	sme_alloc(target, true);
 	if (!target->thread.za_state) {
 		ret = -ENOMEM;
-		clear_tsk_thread_flag(target, TIF_SME);
 		goto out;
 	}
 
@@ -1351,7 +1374,7 @@ enum aarch64_regset {
 #ifdef CONFIG_ARM64_SVE
 	REGSET_SVE,
 #endif
-#ifdef CONFIG_ARM64_SVE
+#ifdef CONFIG_ARM64_SME
 	REGSET_SSVE,
 	REGSET_ZA,
 #endif
@@ -1392,7 +1415,7 @@ static const struct user_regset aarch64_regsets[] = {
 	},
 	[REGSET_TLS] = {
 		.core_note_type = NT_ARM_TLS,
-		.n = 1,
+		.n = 2,
 		.size = sizeof(void *),
 		.align = sizeof(void *),
 		.regset_get = tls_get,
@@ -1427,7 +1450,8 @@ static const struct user_regset aarch64_regsets[] = {
 #ifdef CONFIG_ARM64_SVE
 	[REGSET_SVE] = { /* Scalable Vector Extension */
 		.core_note_type = NT_ARM_SVE,
-		.n = DIV_ROUND_UP(SVE_PT_SIZE(SVE_VQ_MAX, SVE_PT_REGS_SVE),
+		.n = DIV_ROUND_UP(SVE_PT_SIZE(ARCH_SVE_VQ_MAX,
+					      SVE_PT_REGS_SVE),
 				  SVE_VQ_BYTES),
 		.size = SVE_VQ_BYTES,
 		.align = SVE_VQ_BYTES,

@@ -262,8 +262,8 @@ static void put_pasid_state(struct pasid_state *pasid_state)
 
 static void put_pasid_state_wait(struct pasid_state *pasid_state)
 {
-	refcount_dec(&pasid_state->count);
-	wait_event(pasid_state->wq, !refcount_read(&pasid_state->count));
+	if (!refcount_dec_and_test(&pasid_state->count))
+		wait_event(pasid_state->wq, !refcount_read(&pasid_state->count));
 	free_pasid_state(pasid_state);
 }
 
@@ -485,8 +485,8 @@ static void do_fault(struct work_struct *work)
 	flags |= FAULT_FLAG_REMOTE;
 
 	mmap_read_lock(mm);
-	vma = find_extend_vma(mm, address);
-	if (!vma || address < vma->vm_start)
+	vma = vma_lookup(mm, address);
+	if (!vma)
 		/* failed to get a vma in the right range */
 		goto out;
 
@@ -587,6 +587,7 @@ out_drop_state:
 	put_device_state(dev_state);
 
 out:
+	pci_dev_put(pdev);
 	return ret;
 }
 
@@ -777,6 +778,8 @@ int amd_iommu_init_device(struct pci_dev *pdev, int pasids)
 	if (dev_state->domain == NULL)
 		goto out_free_states;
 
+	/* See iommu_is_default_domain() */
+	dev_state->domain->type = IOMMU_DOMAIN_IDENTITY;
 	amd_iommu_domain_direct_map(dev_state->domain);
 
 	ret = amd_iommu_domain_enable_v2(dev_state->domain, pasids);

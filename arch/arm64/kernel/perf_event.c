@@ -168,7 +168,11 @@ armv8pmu_events_sysfs_show(struct device *dev,
 	PMU_EVENT_ATTR_ID(name, armv8pmu_events_sysfs_show, config)
 
 static struct attribute *armv8_pmuv3_event_attrs[] = {
-	ARMV8_EVENT_ATTR(sw_incr, ARMV8_PMUV3_PERFCTR_SW_INCR),
+	/*
+	 * Don't expose the sw_incr event in /sys. It's not usable as writes to
+	 * PMSWINC_EL0 will trap as PMUSERENR.{SW,EN}=={0,0} and event rotation
+	 * means we don't have a fixed event<->counter relationship regardless.
+	 */
 	ARMV8_EVENT_ATTR(l1i_cache_refill, ARMV8_PMUV3_PERFCTR_L1I_CACHE_REFILL),
 	ARMV8_EVENT_ATTR(l1i_tlb_refill, ARMV8_PMUV3_PERFCTR_L1I_TLB_REFILL),
 	ARMV8_EVENT_ATTR(l1d_cache_refill, ARMV8_PMUV3_PERFCTR_L1D_CACHE_REFILL),
@@ -390,7 +394,7 @@ static const struct attribute_group armv8_pmuv3_caps_attr_group = {
  */
 static bool armv8pmu_has_long_event(struct arm_pmu *cpu_pmu)
 {
-	return (cpu_pmu->pmuver >= ID_AA64DFR0_PMUVER_8_5);
+	return (cpu_pmu->pmuver >= ID_AA64DFR0_EL1_PMUVer_V3P5);
 }
 
 static inline bool armv8pmu_event_has_user_read(struct perf_event *event)
@@ -1145,8 +1149,8 @@ static void __armv8pmu_probe_pmu(void *info)
 
 	dfr0 = read_sysreg(id_aa64dfr0_el1);
 	pmuver = cpuid_feature_extract_unsigned_field(dfr0,
-			ID_AA64DFR0_PMUVER_SHIFT);
-	if (pmuver == ID_AA64DFR0_PMUVER_IMP_DEF || pmuver == 0)
+			ID_AA64DFR0_EL1_PMUVer_SHIFT);
+	if (pmuver == ID_AA64DFR0_EL1_PMUVer_IMP_DEF || pmuver == 0)
 		return;
 
 	cpu_pmu->pmuver = pmuver;
@@ -1172,7 +1176,7 @@ static void __armv8pmu_probe_pmu(void *info)
 			     pmceid, ARMV8_PMUV3_MAX_COMMON_EVENTS);
 
 	/* store PMMIR_EL1 register for sysfs */
-	if (pmuver >= ID_AA64DFR0_PMUVER_8_4 && (pmceid_raw[1] & BIT(31)))
+	if (pmuver >= ID_AA64DFR0_EL1_PMUVer_V3P4 && (pmceid_raw[1] & BIT(31)))
 		cpu_pmu->reg_pmmir = read_cpuid(PMMIR_EL1);
 	else
 		cpu_pmu->reg_pmmir = 0;

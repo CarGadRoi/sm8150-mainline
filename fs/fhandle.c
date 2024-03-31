@@ -14,7 +14,7 @@
 #include "internal.h"
 #include "mount.h"
 
-static long do_sys_name_to_handle(struct path *path,
+static long do_sys_name_to_handle(const struct path *path,
 				  struct file_handle __user *ufh,
 				  int __user *mnt_id)
 {
@@ -37,7 +37,7 @@ static long do_sys_name_to_handle(struct path *path,
 	if (f_handle.handle_bytes > MAX_HANDLE_SZ)
 		return -EINVAL;
 
-	handle = kmalloc(sizeof(struct file_handle) + f_handle.handle_bytes,
+	handle = kzalloc(sizeof(struct file_handle) + f_handle.handle_bytes,
 			 GFP_KERNEL);
 	if (!handle)
 		return -ENOMEM;

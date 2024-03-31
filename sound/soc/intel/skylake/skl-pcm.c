@@ -251,8 +251,10 @@ static int skl_pcm_open(struct snd_pcm_substream *substream,
 	snd_pcm_set_sync(substream);
 
 	mconfig = skl_tplg_fe_get_cpr_module(dai, substream->stream);
-	if (!mconfig)
+	if (!mconfig) {
+		kfree(dma_params);
 		return -EINVAL;
+	}
 
 	skl_tplg_d0i3_get(skl, mconfig->d0i3_caps);
 
@@ -275,7 +277,7 @@ static int skl_pcm_prepare(struct snd_pcm_substream *substream,
 	 * calls prepare another time, reset the FW pipe to clean state
 	 */
 	if (mconfig &&
-		(substream->runtime->status->state == SNDRV_PCM_STATE_XRUN ||
+		(substream->runtime->state == SNDRV_PCM_STATE_XRUN ||
 		 mconfig->pipe->state == SKL_PIPE_CREATED ||
 		 mconfig->pipe->state == SKL_PIPE_PAUSED)) {
 
@@ -593,7 +595,7 @@ static int skl_link_pcm_prepare(struct snd_pcm_substream *substream,
 	/* In case of XRUN recovery, reset the FW pipe to clean state */
 	mconfig = skl_tplg_be_get_cpr_module(dai, substream->stream);
 	if (mconfig && !mconfig->pipe->passthru &&
-		(substream->runtime->status->state == SNDRV_PCM_STATE_XRUN))
+		(substream->runtime->state == SNDRV_PCM_STATE_XRUN))
 		skl_reset_pipe(skl, mconfig->pipe);
 
 	return 0;
@@ -1471,6 +1473,7 @@ int skl_platform_register(struct device *dev)
 		dais = krealloc(skl->dais, sizeof(skl_fe_dai) +
 				sizeof(skl_platform_dai), GFP_KERNEL);
 		if (!dais) {
+			kfree(skl->dais);
 			ret = -ENOMEM;
 			goto err;
 		}
@@ -1483,8 +1486,10 @@ int skl_platform_register(struct device *dev)
 
 	ret = devm_snd_soc_register_component(dev, &skl_component,
 					 skl->dais, num_dais);
-	if (ret)
+	if (ret) {
+		kfree(skl->dais);
 		dev_err(dev, "soc component registration failed %d\n", ret);
+	}
 err:
 	return ret;
 }

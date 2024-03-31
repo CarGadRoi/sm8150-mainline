@@ -176,7 +176,8 @@ virt_to_phys_or_null_size(void *va, unsigned long size)
 
 int __init efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
 {
-	unsigned long pfn, text, pf, rodata;
+	extern const u8 __efi64_thunk_ret_tramp[];
+	unsigned long pfn, text, pf, rodata, tramp;
 	struct page *page;
 	unsigned npages;
 	pgd_t *pgd = efi_mm.pgd;
@@ -238,11 +239,9 @@ int __init efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
 
 	npages = (_etext - _text) >> PAGE_SHIFT;
 	text = __pa(_text);
-	pfn = text >> PAGE_SHIFT;
 
-	pf = _PAGE_ENC;
-	if (kernel_map_pages_in_pgd(pgd, pfn, text, npages, pf)) {
-		pr_err("Failed to map kernel text 1:1\n");
+	if (kernel_unmap_pages_in_pgd(pgd, text, npages)) {
+		pr_err("Failed to unmap kernel text 1:1 mapping\n");
 		return 1;
 	}
 
@@ -253,6 +252,15 @@ int __init efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
 	pf = _PAGE_NX | _PAGE_ENC;
 	if (kernel_map_pages_in_pgd(pgd, pfn, rodata, npages, pf)) {
 		pr_err("Failed to map kernel rodata 1:1\n");
+		return 1;
+	}
+
+	tramp = __pa(__efi64_thunk_ret_tramp);
+	pfn = tramp >> PAGE_SHIFT;
+
+	pf = _PAGE_ENC;
+	if (kernel_map_pages_in_pgd(pgd, pfn, tramp, 1, pf)) {
+		pr_err("Failed to map mixed mode return trampoline\n");
 		return 1;
 	}
 
@@ -839,9 +847,9 @@ efi_set_virtual_address_map(unsigned long memory_map_size,
 
 	/* Disable interrupts around EFI calls: */
 	local_irq_save(flags);
-	status = efi_call(efi.runtime->set_virtual_address_map,
-			  memory_map_size, descriptor_size,
-			  descriptor_version, virtual_map);
+	status = arch_efi_call_virt(efi.runtime, set_virtual_address_map,
+				    memory_map_size, descriptor_size,
+				    descriptor_version, virtual_map);
 	local_irq_restore(flags);
 
 	efi_fpu_end();

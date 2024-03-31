@@ -51,7 +51,7 @@ static DEFINE_IDR(acm_minors);
 static DEFINE_MUTEX(acm_minors_lock);
 
 static void acm_tty_set_termios(struct tty_struct *tty,
-				struct ktermios *termios_old);
+				const struct ktermios *termios_old);
 
 /*
  * acm_minors accessors
@@ -892,6 +892,9 @@ static int acm_tty_break_ctl(struct tty_struct *tty, int state)
 	struct acm *acm = tty->driver_data;
 	int retval;
 
+	if (!(acm->ctrl_caps & USB_CDC_CAP_BRK))
+		return -EOPNOTSUPP;
+
 	retval = acm_send_break(acm, state ? 0xffff : 0);
 	if (retval < 0)
 		dev_dbg(&acm->control->dev,
@@ -1049,7 +1052,7 @@ static int acm_tty_ioctl(struct tty_struct *tty,
 }
 
 static void acm_tty_set_termios(struct tty_struct *tty,
-						struct ktermios *termios_old)
+				const struct ktermios *termios_old)
 {
 	struct acm *acm = tty->driver_data;
 	struct ktermios *termios = &tty->termios;
@@ -1809,6 +1812,9 @@ static const struct usb_device_id acm_ids[] = {
 	},
 	{ USB_DEVICE(0x09d8, 0x0320), /* Elatec GmbH TWN3 */
 	.driver_info = NO_UNION_NORMAL, /* has misplaced union descriptor */
+	},
+	{ USB_DEVICE(0x0c26, 0x0020), /* Icom ICF3400 Serie */
+	.driver_info = NO_UNION_NORMAL, /* reports zero length descriptor */
 	},
 	{ USB_DEVICE(0x0ca6, 0xa050), /* Castles VEGA3000 */
 	.driver_info = NO_UNION_NORMAL, /* reports zero length descriptor */

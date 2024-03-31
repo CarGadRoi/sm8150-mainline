@@ -165,6 +165,7 @@ enum MWIFIEX_802_11_PRIVACY_FILTER {
 #define TLV_TYPE_STA_MAC_ADDR       (PROPRIETARY_TLV_BASE_ID + 32)
 #define TLV_TYPE_BSSID              (PROPRIETARY_TLV_BASE_ID + 35)
 #define TLV_TYPE_CHANNELBANDLIST    (PROPRIETARY_TLV_BASE_ID + 42)
+#define TLV_TYPE_UAP_MAC_ADDRESS    (PROPRIETARY_TLV_BASE_ID + 43)
 #define TLV_TYPE_UAP_BEACON_PERIOD  (PROPRIETARY_TLV_BASE_ID + 44)
 #define TLV_TYPE_UAP_DTIM_PERIOD    (PROPRIETARY_TLV_BASE_ID + 45)
 #define TLV_TYPE_UAP_BCAST_SSID     (PROPRIETARY_TLV_BASE_ID + 48)
@@ -2104,7 +2105,7 @@ struct mwifiex_fw_mef_entry {
 struct host_cmd_ds_mef_cfg {
 	__le32 criteria;
 	__le16 num_entries;
-	struct mwifiex_fw_mef_entry mef_entry[];
+	u8 mef_entry_data[];
 } __packed;
 
 #define CONNECTION_TYPE_INFRA   0
@@ -2254,7 +2255,7 @@ struct coalesce_receive_filt_rule {
 struct host_cmd_ds_coalesce_cfg {
 	__le16 action;
 	__le16 num_of_rules;
-	struct coalesce_receive_filt_rule rule[];
+	u8 rule_data[];
 } __packed;
 
 struct host_cmd_ds_multi_chan_policy {

@@ -27,7 +27,7 @@
 
 #include "nt36xxx_mem_map.h"
 
-#define NVT_DEBUG 0
+#define NVT_DEBUG 1
 
 //---GPIO number---
 #define NVTTOUCH_RST_PIN 980
@@ -43,7 +43,7 @@
 
 
 //---SPI driver info.---
-#define NVT_SPI_NAME "NVT-ts"
+#define NVT_SPI_NAME "NVT-ts-spi"
 
 #if NVT_DEBUG
 #define NVT_LOG(fmt, args...)    pr_err("[%s] %s %d: " fmt, NVT_SPI_NAME, __func__, __LINE__, ##args)
@@ -75,27 +75,16 @@ extern const uint16_t touch_key_array[TOUCH_KEY_NUM];
 #define NVT_TOUCH_SUPPORT_HW_RST 0
 
 //---Customerized func.---
-#define NVT_TOUCH_PROC 0
-#define NVT_TOUCH_EXT_PROC 0
 #define NVT_TOUCH_MP 0
 #define NVT_TOUCH_MP_SETTING_CRITERIA_FROM_CSV 0
 #define MT_PROTOCOL_B 1
-#define WAKEUP_GESTURE 0
 #define FUNCPAGE_PALM 4
 #define PACKET_PALM_ON 3
 #define PACKET_PALM_OFF 4
 
-#if WAKEUP_GESTURE
-extern const uint16_t gesture_key_array[];
-#endif
 #define BOOT_UPDATE_FIRMWARE 1
-#define DEFAULT_BOOT_UPDATE_FIRMWARE_NAME "novatek_nt36523_fw.bin"
+#define DEFAULT_BOOT_UPDATE_FIRMWARE_NAME "novatek/nt36523.bin"
 #define DEFAULT_MP_UPDATE_FIRMWARE_NAME   "novatek_ts_mp.bin"
-#define DEFAULT_DEBUG_FW_NAME "novatek_debug_fw.bin"
-#define DEFAULT_DEBUG_MP_NAME "novatek_debug_mp.bin"
-#define POINT_DATA_CHECKSUM 1
-#define POINT_DATA_CHECKSUM_LEN 65
-#define CHECK_PEN_DATA_CHECKSUM 0
 
 //---ESD Protect.---
 #define NVT_TOUCH_ESD_PROTECT 1
@@ -130,13 +119,17 @@ struct nvt_ts_data {
 	struct notifier_block pen_charge_state_notifier;
 	uint16_t addr;
 	int8_t phys[32];
+#if defined(CONFIG_FB)
 #ifdef CONFIG_DRM
 	struct notifier_block drm_notif;
+#else
+	struct notifier_block fb_notif;
+#endif
 #endif
 	uint32_t config_array_size;
 	struct nvt_config_info *config_array;
-	const u8 *fw_name;
-	const u8 *mp_name;
+	const char *fw_name;
+	bool lkdown_readed;
 	uint8_t fw_ver;
 	uint8_t x_num;
 	uint8_t y_num;
@@ -170,15 +163,10 @@ struct nvt_ts_data {
 	struct workqueue_struct *event_wq;
 	struct work_struct suspend_work;
 	struct work_struct resume_work;
-	struct attribute_group *attrs;
 	int result_type;
 	int panel_index;
 	uint32_t spi_max_freq;
 	int db_wakeup;
-
-#ifdef CONFIG_TOUCHSCREEN_NVT_DEBUG_FS
-		struct dentry *debugfs;
-#endif
 	uint8_t debug_flag;
 	bool fw_debug;
 	bool dev_pm_suspend;
@@ -189,12 +177,6 @@ struct nvt_ts_data {
 	struct pinctrl_state *pinctrl_state_active;
 	struct pinctrl_state *pinctrl_state_suspend;
 };
-
-#if NVT_TOUCH_PROC
-struct nvt_flash_data{
-	rwlock_t lock;
-};
-#endif
 
 typedef enum {
 	RESET_STATE_INIT = 0xA0,// IC reset
@@ -251,6 +233,7 @@ int32_t nvt_set_page(uint32_t addr);
 int32_t nvt_write_addr(uint32_t addr, uint8_t data);
 bool nvt_get_dbgfw_status(void);
 int32_t nvt_set_pocket_palm_switch(uint8_t pocket_palm_switch);
+int32_t disable_pen_input_device(bool disable);
 #if NVT_TOUCH_ESD_PROTECT
 extern void nvt_esd_check_enable(uint8_t enable);
 #endif /* #if NVT_TOUCH_ESD_PROTECT */

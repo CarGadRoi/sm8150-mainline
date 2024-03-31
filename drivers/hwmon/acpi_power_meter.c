@@ -31,6 +31,7 @@
 #define POWER_METER_CAN_NOTIFY	(1 << 3)
 #define POWER_METER_IS_BATTERY	(1 << 8)
 #define UNKNOWN_HYSTERESIS	0xFFFFFFFF
+#define UNKNOWN_POWER		0xFFFFFFFF
 
 #define METER_NOTIFY_CONFIG	0x80
 #define METER_NOTIFY_TRIP	0x81
@@ -348,6 +349,9 @@ static ssize_t show_power(struct device *dev,
 	update_meter(resource);
 	mutex_unlock(&resource->lock);
 
+	if (resource->power == UNKNOWN_POWER)
+		return -ENODATA;
+
 	return sprintf(buf, "%llu\n", resource->power * 1000);
 }
 
@@ -598,7 +602,7 @@ static int read_domain_devices(struct acpi_power_meter_resource *resource)
 			continue;
 
 		/* Create a symlink to domain objects */
-		obj = acpi_bus_get_acpi_device(element->reference.handle);
+		obj = acpi_get_acpi_dev(element->reference.handle);
 		resource->domain_devices[i] = obj;
 		if (!obj)
 			continue;
@@ -927,8 +931,6 @@ static int acpi_power_meter_remove(struct acpi_device *device)
 	return 0;
 }
 
-#ifdef CONFIG_PM_SLEEP
-
 static int acpi_power_meter_resume(struct device *dev)
 {
 	struct acpi_power_meter_resource *resource;
@@ -946,9 +948,8 @@ static int acpi_power_meter_resume(struct device *dev)
 	return 0;
 }
 
-#endif /* CONFIG_PM_SLEEP */
-
-static SIMPLE_DEV_PM_OPS(acpi_power_meter_pm, NULL, acpi_power_meter_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(acpi_power_meter_pm, NULL,
+				acpi_power_meter_resume);
 
 static struct acpi_driver acpi_power_meter_driver = {
 	.name = "power_meter",
@@ -959,7 +960,7 @@ static struct acpi_driver acpi_power_meter_driver = {
 		.remove = acpi_power_meter_remove,
 		.notify = acpi_power_meter_notify,
 		},
-	.drv.pm = &acpi_power_meter_pm,
+	.drv.pm = pm_sleep_ptr(&acpi_power_meter_pm),
 };
 
 /* Module init/exit routines */

@@ -665,33 +665,33 @@ u64 ata_tf_read_block(const struct ata_taskfile *tf, struct ata_device *dev)
 
 /**
  *	ata_build_rw_tf - Build ATA taskfile for given read/write request
- *	@tf: Target ATA taskfile
- *	@dev: ATA device @tf belongs to
+ *	@qc: Metadata associated with the taskfile to build
  *	@block: Block address
  *	@n_block: Number of blocks
  *	@tf_flags: RW/FUA etc...
- *	@tag: tag
  *	@class: IO priority class
  *
  *	LOCKING:
  *	None.
  *
- *	Build ATA taskfile @tf for read/write request described by
- *	@block, @n_block, @tf_flags and @tag on @dev.
+ *	Build ATA taskfile for the command @qc for read/write request described
+ *	by @block, @n_block, @tf_flags and @class.
  *
  *	RETURNS:
  *
  *	0 on success, -ERANGE if the request is too large for @dev,
  *	-EINVAL if the request is invalid.
  */
-int ata_build_rw_tf(struct ata_taskfile *tf, struct ata_device *dev,
-		    u64 block, u32 n_block, unsigned int tf_flags,
-		    unsigned int tag, int class)
+int ata_build_rw_tf(struct ata_queued_cmd *qc, u64 block, u32 n_block,
+		    unsigned int tf_flags, int class)
 {
+	struct ata_taskfile *tf = &qc->tf;
+	struct ata_device *dev = qc->dev;
+
 	tf->flags |= ATA_TFLAG_ISADDR | ATA_TFLAG_DEVICE;
 	tf->flags |= tf_flags;
 
-	if (ata_ncq_enabled(dev) && !ata_tag_internal(tag)) {
+	if (ata_ncq_enabled(dev)) {
 		/* yay, NCQ */
 		if (!lba_48_ok(block, n_block))
 			return -ERANGE;
@@ -704,7 +704,7 @@ int ata_build_rw_tf(struct ata_taskfile *tf, struct ata_device *dev,
 		else
 			tf->command = ATA_CMD_FPDMA_READ;
 
-		tf->nsect = tag << 3;
+		tf->nsect = qc->hw_tag << 3;
 		tf->hob_feature = (n_block >> 8) & 0xff;
 		tf->feature = n_block & 0xff;
 
@@ -719,7 +719,7 @@ int ata_build_rw_tf(struct ata_taskfile *tf, struct ata_device *dev,
 		if (tf->flags & ATA_TFLAG_FUA)
 			tf->device |= 1 << 7;
 
-		if (dev->flags & ATA_DFLAG_NCQ_PRIO_ENABLE &&
+		if (dev->flags & ATA_DFLAG_NCQ_PRIO_ENABLED &&
 		    class == IOPRIO_CLASS_RT)
 			tf->hob_nsect |= ATA_PRIO_HIGH << ATA_SHIFT_PRIO;
 	} else if (dev->flags & ATA_DFLAG_LBA) {
@@ -1578,8 +1578,8 @@ static unsigned ata_exec_internal_sg(struct ata_device *dev,
 			else
 				ata_qc_complete(qc);
 
-			ata_dev_warn(dev, "qc timeout (cmd 0x%x)\n",
-				     command);
+			ata_dev_warn(dev, "qc timeout after %u msecs (cmd 0x%x)\n",
+				     timeout, command);
 		}
 
 		spin_unlock_irqrestore(ap->lock, flags);
@@ -1944,6 +1944,100 @@ retry:
 }
 
 /**
+ *	ata_dev_power_set_standby - Set a device power mode to standby
+ *	@dev: target device
+ *
+ *	Issue a STANDBY IMMEDIATE command to set a device power mode to standby.
+ *	For an HDD device, this spins down the disks.
+ *
+ *	LOCKING:
+ *	Kernel thread context (may sleep).
+ */
+void ata_dev_power_set_standby(struct ata_device *dev)
+{
+	unsigned long ap_flags = dev->link->ap->flags;
+	struct ata_taskfile tf;
+	unsigned int err_mask;
+
+	/* Issue STANDBY IMMEDIATE command only if supported by the device */
+	if (dev->class != ATA_DEV_ATA && dev->class != ATA_DEV_ZAC)
+		return;
+
+	/*
+	 * Some odd clown BIOSes issue spindown on power off (ACPI S4 or S5)
+	 * causing some drives to spin up and down again. For these, do nothing
+	 * if we are being called on shutdown.
+	 */
+	if ((ap_flags & ATA_FLAG_NO_POWEROFF_SPINDOWN) &&
+	    system_state == SYSTEM_POWER_OFF)
+		return;
+
+	if ((ap_flags & ATA_FLAG_NO_HIBERNATE_SPINDOWN) &&
+	    system_entering_hibernation())
+		return;
+
+	ata_tf_init(dev, &tf);
+	tf.flags |= ATA_TFLAG_DEVICE | ATA_TFLAG_ISADDR;
+	tf.protocol = ATA_PROT_NODATA;
+	tf.command = ATA_CMD_STANDBYNOW1;
+
+	ata_dev_notice(dev, "Entering standby power mode\n");
+
+	err_mask = ata_exec_internal(dev, &tf, NULL, DMA_NONE, NULL, 0, 0);
+	if (err_mask)
+		ata_dev_err(dev, "STANDBY IMMEDIATE failed (err_mask=0x%x)\n",
+			    err_mask);
+}
+
+/**
+ *	ata_dev_power_set_active -  Set a device power mode to active
+ *	@dev: target device
+ *
+ *	Issue a VERIFY command to enter to ensure that the device is in the
+ *	active power mode. For a spun-down HDD (standby or idle power mode),
+ *	the VERIFY command will complete after the disk spins up.
+ *
+ *	LOCKING:
+ *	Kernel thread context (may sleep).
+ */
+void ata_dev_power_set_active(struct ata_device *dev)
+{
+	struct ata_taskfile tf;
+	unsigned int err_mask;
+
+	/* If the device is already sleeping, do nothing. */
+	if (dev->flags & ATA_DFLAG_SLEEPING)
+		return;
+
+	/*
+	 * Issue READ VERIFY SECTORS command for 1 sector at lba=0 only
+	 * if supported by the device.
+	 */
+	if (dev->class != ATA_DEV_ATA && dev->class != ATA_DEV_ZAC)
+		return;
+
+	ata_tf_init(dev, &tf);
+	tf.flags |= ATA_TFLAG_DEVICE | ATA_TFLAG_ISADDR;
+	tf.protocol = ATA_PROT_NODATA;
+	tf.command = ATA_CMD_VERIFY;
+	tf.nsect = 1;
+	if (dev->flags & ATA_DFLAG_LBA) {
+		tf.flags |= ATA_TFLAG_LBA;
+		tf.device |= ATA_LBA;
+	} else {
+		/* CHS */
+		tf.lbal = 0x1; /* sect */
+	}
+
+	ata_dev_notice(dev, "Entering active power mode\n");
+
+	err_mask = ata_exec_internal(dev, &tf, NULL, DMA_NONE, NULL, 0, 0);
+	if (err_mask)
+		ata_dev_err(dev, "VERIFY failed (err_mask=0x%x)\n",
+			    err_mask);
+}
+
+/**
  *	ata_read_log_page - read a specific log page
  *	@dev: target device
  *	@log: log to read
@@ -2171,7 +2265,7 @@ static void ata_dev_config_ncq_prio(struct ata_device *dev)
 	return;
 
 not_supported:
-	dev->flags &= ~ATA_DFLAG_NCQ_PRIO_ENABLE;
+	dev->flags &= ~ATA_DFLAG_NCQ_PRIO_ENABLED;
 	dev->flags &= ~ATA_DFLAG_NCQ_PRIO;
 }
 
@@ -2366,7 +2460,7 @@ static int ata_dev_config_lba(struct ata_device *dev)
 {
 	const u16 *id = dev->id;
 	const char *lba_desc;
-	char ncq_desc[24];
+	char ncq_desc[32];
 	int ret;
 
 	dev->flags |= ATA_DFLAG_LBA;
@@ -3021,7 +3115,8 @@ static void sata_print_link_status(struct ata_link *link)
 
 	if (sata_scr_read(link, SCR_STATUS, &sstatus))
 		return;
-	sata_scr_read(link, SCR_CONTROL, &scontrol);
+	if (sata_scr_read(link, SCR_CONTROL, &scontrol))
+		return;
 
 	if (ata_phys_link_online(link)) {
 		tmp = (sstatus >> 4) & 0xf;
@@ -3107,7 +3202,7 @@ int sata_down_spd_limit(struct ata_link *link, u32 spd_limit)
 	 */
 	if (spd > 1)
 		mask &= (1 << (spd - 1)) - 1;
-	else
+	else if (link->sata_spd)
 		return -EINVAL;
 
 	/* were we already at the bottom? */
@@ -3988,6 +4083,10 @@ static const struct ata_blacklist_entry ata_device_blacklist [] = {
 	{ "PIONEER DVD-RW  DVR-212D",	NULL,	ATA_HORKAGE_NOSETXFER },
 	{ "PIONEER DVD-RW  DVR-216D",	NULL,	ATA_HORKAGE_NOSETXFER },
 
+	/* These specific Pioneer models have LPM issues */
+	{ "PIONEER BD-RW   BDR-207M",	NULL,	ATA_HORKAGE_NOLPM },
+	{ "PIONEER BD-RW   BDR-205",	NULL,	ATA_HORKAGE_NOLPM },
+
 	/* Crucial BX100 SSD 500GB has broken LPM support */
 	{ "CT500BX100SSD1",		NULL,	ATA_HORKAGE_NOLPM },
 
@@ -4039,6 +4138,9 @@ static const struct ata_blacklist_entry ata_device_blacklist [] = {
 	{ "Samsung SSD 870*",		NULL,	ATA_HORKAGE_NO_NCQ_TRIM |
 						ATA_HORKAGE_ZERO_AFTER_TRIM |
 						ATA_HORKAGE_NO_NCQ_ON_ATI },
+	{ "SAMSUNG*MZ7LH*",		NULL,	ATA_HORKAGE_NO_NCQ_TRIM |
+						ATA_HORKAGE_ZERO_AFTER_TRIM |
+						ATA_HORKAGE_NO_NCQ_ON_ATI, },
 	{ "FCCT*M500*",			NULL,	ATA_HORKAGE_NO_NCQ_TRIM |
 						ATA_HORKAGE_ZERO_AFTER_TRIM },
 
@@ -4295,7 +4397,6 @@ static void ata_dev_xfermask(struct ata_device *dev)
 static unsigned int ata_dev_set_xfermode(struct ata_device *dev)
 {
 	struct ata_taskfile tf;
-	unsigned int err_mask;
 
 	/* set up set-features taskfile */
 	ata_dev_dbg(dev, "set features - xfer mode\n");
@@ -4317,20 +4418,20 @@ static unsigned int ata_dev_set_xfermode(struct ata_device *dev)
 	else /* In the ancient relic department - skip all of this */
 		return 0;
 
-	/* On some disks, this command causes spin-up, so we need longer timeout */
-	err_mask = ata_exec_internal(dev, &tf, NULL, DMA_NONE, NULL, 0, 15000);
-
-	return err_mask;
+	/*
+	 * On some disks, this command causes spin-up, so we need longer
+	 * timeout.
+	 */
+	return ata_exec_internal(dev, &tf, NULL, DMA_NONE, NULL, 0, 15000);
 }
 
 /**
- *	ata_dev_set_feature - Issue SET FEATURES - SATA FEATURES
+ *	ata_dev_set_feature - Issue SET FEATURES
  *	@dev: Device to which command will be sent
- *	@enable: Whether to enable or disable the feature
- *	@feature: The sector count represents the feature to set
+ *	@subcmd: The SET FEATURES subcommand to be sent
+ *	@action: The sector count represents a subcommand specific action
  *
- *	Issue SET FEATURES - SATA FEATURES command to device @dev
- *	on port @ap with sector count
+ *	Issue SET FEATURES command to device @dev on port @ap with sector count
  *
  *	LOCKING:
  *	PCI/etc. bus probe sem.
@@ -4338,28 +4439,26 @@ static unsigned int ata_dev_set_xfermode(struct ata_device *dev)
  *	RETURNS:
  *	0 on success, AC_ERR_* mask otherwise.
  */
-unsigned int ata_dev_set_feature(struct ata_device *dev, u8 enable, u8 feature)
+unsigned int ata_dev_set_feature(struct ata_device *dev, u8 subcmd, u8 action)
 {
 	struct ata_taskfile tf;
-	unsigned int err_mask;
 	unsigned int timeout = 0;
 
 	/* set up set-features taskfile */
-	ata_dev_dbg(dev, "set features - SATA features\n");
+	ata_dev_dbg(dev, "set features\n");
 
 	ata_tf_init(dev, &tf);
 	tf.command = ATA_CMD_SET_FEATURES;
-	tf.feature = enable;
+	tf.feature = subcmd;
 	tf.flags |= ATA_TFLAG_ISADDR | ATA_TFLAG_DEVICE;
 	tf.protocol = ATA_PROT_NODATA;
-	tf.nsect = feature;
+	tf.nsect = action;
 
-	if (enable == SETFEATURES_SPINUP)
+	if (subcmd == SETFEATURES_SPINUP)
 		timeout = ata_probe_timeout ?
 			  ata_probe_timeout * 1000 : SETFEATURES_SPINUP_TIMEOUT;
-	err_mask = ata_exec_internal(dev, &tf, NULL, DMA_NONE, NULL, 0, timeout);
 
-	return err_mask;
+	return ata_exec_internal(dev, &tf, NULL, DMA_NONE, NULL, 0, timeout);
 }
 EXPORT_SYMBOL_GPL(ata_dev_set_feature);
 
@@ -4976,17 +5075,19 @@ static void ata_port_request_pm(struct ata_port *ap, pm_message_t mesg,
 	struct ata_link *link;
 	unsigned long flags;
 
-	/* Previous resume operation might still be in
-	 * progress.  Wait for PM_PENDING to clear.
-	 */
-	if (ap->pflags & ATA_PFLAG_PM_PENDING) {
-		ata_port_wait_eh(ap);
-		WARN_ON(ap->pflags & ATA_PFLAG_PM_PENDING);
-	}
-
-	/* request PM ops to EH */
 	spin_lock_irqsave(ap->lock, flags);
 
+	/*
+	 * A previous PM operation might still be in progress. Wait for
+	 * ATA_PFLAG_PM_PENDING to clear.
+	 */
+	if (ap->pflags & ATA_PFLAG_PM_PENDING) {
+		spin_unlock_irqrestore(ap->lock, flags);
+		ata_port_wait_eh(ap);
+		spin_lock_irqsave(ap->lock, flags);
+	}
+
+	/* Request PM operation to EH */
 	ap->pm_mesg = mesg;
 	ap->pflags |= ATA_PFLAG_PM_PENDING;
 	ata_for_each_link(link, ap, HOST_FIRST) {
@@ -4998,10 +5099,8 @@ static void ata_port_request_pm(struct ata_port *ap, pm_message_t mesg,
 
 	spin_unlock_irqrestore(ap->lock, flags);
 
-	if (!async) {
+	if (!async)
 		ata_port_wait_eh(ap);
-		WARN_ON(ap->pflags & ATA_PFLAG_PM_PENDING);
-	}
 }
 
 /*
@@ -5017,11 +5116,27 @@ static const unsigned int ata_port_suspend_ehi = ATA_EHI_QUIET
 
 static void ata_port_suspend(struct ata_port *ap, pm_message_t mesg)
 {
+	/*
+	 * We are about to suspend the port, so we do not care about
+	 * scsi_rescan_device() calls scheduled by previous resume operations.
+	 * The next resume will schedule the rescan again. So cancel any rescan
+	 * that is not done yet.
+	 */
+	cancel_delayed_work_sync(&ap->scsi_rescan_task);
+
 	ata_port_request_pm(ap, mesg, 0, ata_port_suspend_ehi, false);
 }
 
 static void ata_port_suspend_async(struct ata_port *ap, pm_message_t mesg)
 {
+	/*
+	 * We are about to suspend the port, so we do not care about
+	 * scsi_rescan_device() calls scheduled by previous resume operations.
+	 * The next resume will schedule the rescan again. So cancel any rescan
+	 * that is not done yet.
+	 */
+	cancel_delayed_work_sync(&ap->scsi_rescan_task);
+
 	ata_port_request_pm(ap, mesg, 0, ata_port_suspend_ehi, true);
 }
 
@@ -5168,7 +5283,7 @@ EXPORT_SYMBOL_GPL(ata_host_resume);
 #endif
 
 const struct device_type ata_port_type = {
-	.name = "ata_port",
+	.name = ATA_PORT_TYPE_NAME,
 #ifdef CONFIG_PM
 	.pm = &ata_port_pm_ops,
 #endif
@@ -5308,7 +5423,7 @@ struct ata_port *ata_port_alloc(struct ata_host *host)
 
 	mutex_init(&ap->scsi_scan_mutex);
 	INIT_DELAYED_WORK(&ap->hotplug_task, ata_scsi_hotplug);
-	INIT_WORK(&ap->scsi_rescan_task, ata_scsi_dev_rescan);
+	INIT_DELAYED_WORK(&ap->scsi_rescan_task, ata_scsi_dev_rescan);
 	INIT_LIST_HEAD(&ap->eh_done_q);
 	init_waitqueue_head(&ap->eh_wait_q);
 	init_completion(&ap->park_req_pending);
@@ -5901,11 +6016,30 @@ static void ata_port_detach(struct ata_port *ap)
 	if (!ap->ops->error_handler)
 		goto skip_eh;
 
-	/* tell EH we're leaving & flush EH */
+	/* Wait for any ongoing EH */
+	ata_port_wait_eh(ap);
+
+	mutex_lock(&ap->scsi_scan_mutex);
 	spin_lock_irqsave(ap->lock, flags);
+
+	/* Remove scsi devices */
+	ata_for_each_link(link, ap, HOST_FIRST) {
+		ata_for_each_dev(dev, link, ALL) {
+			if (dev->sdev) {
+				spin_unlock_irqrestore(ap->lock, flags);
+				scsi_remove_device(dev->sdev);
+				spin_lock_irqsave(ap->lock, flags);
+				dev->sdev = NULL;
+			}
+		}
+	}
+
+	/* Tell EH to disable all devices */
 	ap->pflags |= ATA_PFLAG_UNLOADING;
 	ata_port_schedule_eh(ap);
+
 	spin_unlock_irqrestore(ap->lock, flags);
+	mutex_unlock(&ap->scsi_scan_mutex);
 
 	/* wait till EH commits suicide */
 	ata_port_wait_eh(ap);
@@ -5914,6 +6048,7 @@ static void ata_port_detach(struct ata_port *ap)
 	WARN_ON(!(ap->pflags & ATA_PFLAG_UNLOADED));
 
 	cancel_delayed_work_sync(&ap->hotplug_task);
+	cancel_delayed_work_sync(&ap->scsi_rescan_task);
 
  skip_eh:
 	/* clean up zpodd on port removal */

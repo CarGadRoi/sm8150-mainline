@@ -1464,10 +1464,14 @@ static int it66121_audio_get_eld(struct device *dev, void *data,
 	struct it66121_ctx *ctx = dev_get_drvdata(dev);
 
 	mutex_lock(&ctx->lock);
-
-	memcpy(buf, ctx->connector->eld,
-	       min(sizeof(ctx->connector->eld), len));
-
+	if (!ctx->connector) {
+		/* Pass en empty ELD if connector not available */
+		dev_dbg(dev, "No connector present, passing empty EDID data");
+		memset(buf, 0, len);
+	} else {
+		memcpy(buf, ctx->connector->eld,
+		       min(sizeof(ctx->connector->eld), len));
+	}
 	mutex_unlock(&ctx->lock);
 
 	return 0;
@@ -1623,15 +1627,13 @@ static int it66121_probe(struct i2c_client *client,
 	return 0;
 }
 
-static int it66121_remove(struct i2c_client *client)
+static void it66121_remove(struct i2c_client *client)
 {
 	struct it66121_ctx *ctx = i2c_get_clientdata(client);
 
 	ite66121_power_off(ctx);
 	drm_bridge_remove(&ctx->bridge);
 	mutex_destroy(&ctx->lock);
-
-	return 0;
 }
 
 static const struct of_device_id it66121_dt_match[] = {

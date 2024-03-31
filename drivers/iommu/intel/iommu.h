@@ -125,6 +125,11 @@
 #define DMAR_MTRR_PHYSMASK8_REG 0x208
 #define DMAR_MTRR_PHYSBASE9_REG 0x210
 #define DMAR_MTRR_PHYSMASK9_REG 0x218
+#define DMAR_PERFCAP_REG	0x300
+#define DMAR_PERFCFGOFF_REG	0x310
+#define DMAR_PERFOVFOFF_REG	0x318
+#define DMAR_PERFCNTROFF_REG	0x31c
+#define DMAR_PERFEVNTCAP_REG	0x380
 #define DMAR_VCCAP_REG		0xe30 /* Virtual command capability register */
 #define DMAR_VCMD_REG		0xe00 /* Virtual command register */
 #define DMAR_VCRSP_REG		0xe10 /* Virtual command response register */
@@ -146,7 +151,10 @@
 /*
  * Decoding Capability Register
  */
-#define cap_5lp_support(c)	(((c) >> 60) & 1)
+#define cap_esrtps(c)		(((c) >> 63) & 1)
+#define cap_esirtps(c)		(((c) >> 62) & 1)
+#define cap_ecmds(c)		(((c) >> 61) & 1)
+#define cap_fl5lp_support(c)	(((c) >> 60) & 1)
 #define cap_pi_support(c)	(((c) >> 59) & 1)
 #define cap_fl1gp_support(c)	(((c) >> 56) & 1)
 #define cap_read_drain(c)	(((c) >> 55) & 1)
@@ -177,7 +185,8 @@
  * Extended Capability Register
  */
 
-#define	ecap_rps(e)		(((e) >> 49) & 0x1)
+#define ecap_pms(e)		(((e) >> 51) & 0x1)
+#define ecap_rps(e)		(((e) >> 49) & 0x1)
 #define ecap_smpwc(e)		(((e) >> 48) & 0x1)
 #define ecap_flts(e)		(((e) >> 47) & 0x1)
 #define ecap_slts(e)		(((e) >> 46) & 0x1)
@@ -197,7 +206,6 @@
 #define ecap_dis(e)		(((e) >> 27) & 0x1)
 #define ecap_nest(e)		(((e) >> 26) & 0x1)
 #define ecap_mts(e)		(((e) >> 25) & 0x1)
-#define ecap_ecs(e)		(((e) >> 24) & 0x1)
 #define ecap_iotlb_offset(e) 	((((e) >> 8) & 0x3ff) * 16)
 #define ecap_max_iotlb_offset(e) (ecap_iotlb_offset(e) + 16)
 #define ecap_coherent(e)	((e) & 0x1)
@@ -208,6 +216,22 @@
 #define ecap_dev_iotlb_support(e)	(((e) >> 2) & 0x1)
 #define ecap_max_handle_mask(e) (((e) >> 20) & 0xf)
 #define ecap_sc_support(e)	(((e) >> 7) & 0x1) /* Snooping Control */
+
+/*
+ * Decoding Perf Capability Register
+ */
+#define pcap_num_cntr(p)	((p) & 0xffff)
+#define pcap_cntr_width(p)	(((p) >> 16) & 0x7f)
+#define pcap_num_event_group(p)	(((p) >> 24) & 0x1f)
+#define pcap_filters_mask(p)	(((p) >> 32) & 0x1f)
+#define pcap_interrupt(p)	(((p) >> 50) & 0x1)
+/* The counter stride is calculated as 2 ^ (x+10) bytes */
+#define pcap_cntr_stride(p)	(1ULL << ((((p) >> 52) & 0x7) + 10))
+
+/*
+ * Decoding Perf Event Capability Register
+ */
+#define pecap_es(p)		((p) & 0xfffffff)
 
 /* Virtual command interface capability */
 #define vccap_pasid(v)		(((v) & DMA_VCS_PAS)) /* PASID allocation */
@@ -265,7 +289,6 @@
 #define DMA_GSTS_CFIS (((u32)1) << 23)
 
 /* DMA_RTADDR_REG */
-#define DMA_RTADDR_RTT (((u64)1) << 11)
 #define DMA_RTADDR_SMT (((u64)1) << 10)
 
 /* CCMD_REG */
@@ -561,6 +584,22 @@ struct dmar_domain {
 					   iommu core */
 };
 
+struct iommu_pmu {
+	struct intel_iommu	*iommu;
+	u32			num_cntr;	/* Number of counters */
+	u32			num_eg;		/* Number of event group */
+	u32			cntr_width;	/* Counter width */
+	u32			cntr_stride;	/* Counter Stride */
+	u32			filter;		/* Bitmask of filter support */
+	void __iomem		*base;		/* the PerfMon base address */
+	void __iomem		*cfg_reg;	/* counter configuration base address */
+	void __iomem		*cntr_reg;	/* counter 0 address*/
+	void __iomem		*overflow;	/* overflow status register */
+
+	u64			*evcap;		/* Indicates all supported events */
+	u32			**cntr_evcap;	/* Supported events of each counter. */
+};
+
 struct intel_iommu {
 	void __iomem	*reg; /* Pointer to hardware regs, virtual addr */
 	u64 		reg_phys; /* physical address of hw register set */
@@ -579,6 +618,7 @@ struct intel_iommu {
 
 #ifdef CONFIG_INTEL_IOMMU
 	unsigned long 	*domain_ids; /* bitmap of domains */
+	unsigned long	*copied_tables; /* bitmap of copied tables */
 	spinlock_t	lock; /* protect context, domain ids */
 	struct root_entry *root_entry; /* virtual address */
 
@@ -587,13 +627,14 @@ struct intel_iommu {
 #ifdef CONFIG_INTEL_IOMMU_SVM
 	struct page_req_dsc *prq;
 	unsigned char prq_name[16];    /* Name for PRQ interrupt */
+	unsigned long prq_seq_number;
 	struct completion prq_complete;
 	struct ioasid_allocator_ops pasid_allocator; /* Custom allocator for PASIDs */
 #endif
 	struct iopf_queue *iopf_queue;
 	unsigned char iopfq_name[16];
 	struct q_inval  *qi;            /* Queued invalidation info */
-	u32 *iommu_state; /* Store iommu states between suspend and resume.*/
+	u32 iommu_state[MAX_SR_DMAR_REGS]; /* Store iommu states between suspend and resume.*/
 
 #ifdef CONFIG_IRQ_REMAP
 	struct ir_table *ir_table;	/* Interrupt remapping info */
@@ -606,6 +647,8 @@ struct intel_iommu {
 
 	struct dmar_drhd_unit *drhd;
 	void *perf_statistic;
+
+	struct iommu_pmu *pmu;
 };
 
 /* PCI domain-device relationship */
@@ -621,6 +664,7 @@ struct device_domain_info {
 	u8 pri_enabled:1;
 	u8 ats_supported:1;
 	u8 ats_enabled:1;
+	u8 dtlb_extra_inval:1;	/* Quirk for devices need extra flush */
 	u8 ats_qdep;
 	struct device *dev; /* it's NULL for PCIe-to-PCI bridge */
 	struct intel_iommu *iommu; /* IOMMU used by this device */
@@ -701,6 +745,11 @@ static inline int nr_pte_to_next_page(struct dma_pte *pte)
 		(struct dma_pte *)ALIGN((unsigned long)pte, VTD_PAGE_SIZE) - pte;
 }
 
+static inline bool context_present(struct context_entry *context)
+{
+	return (context->lo & 1);
+}
+
 extern struct dmar_drhd_unit * dmar_find_matched_drhd_unit(struct pci_dev *dev);
 
 extern int dmar_enable_qi(struct intel_iommu *iommu);
@@ -721,6 +770,9 @@ void qi_flush_piotlb(struct intel_iommu *iommu, u16 did, u32 pasid, u64 addr,
 void qi_flush_dev_iotlb_pasid(struct intel_iommu *iommu, u16 sid, u16 pfsid,
 			      u32 pasid, u16 qdep, u64 addr,
 			      unsigned int size_order);
+void quirk_extra_dev_tlb_flush(struct device_domain_info *info,
+			       unsigned long address, unsigned long pages,
+			       u32 pasid, u16 qdep);
 void qi_flush_pasid_cache(struct intel_iommu *iommu, u16 did, u64 granu,
 			  u32 pasid);
 
@@ -737,7 +789,6 @@ extern int dmar_ir_support(void);
 void *alloc_pgtable_page(int node);
 void free_pgtable_page(void *vaddr);
 void iommu_flush_write_buffer(struct intel_iommu *iommu);
-int intel_iommu_enable_pasid(struct intel_iommu *iommu, struct device *dev);
 struct intel_iommu *device_to_iommu(struct device *dev, u8 *bus, u8 *devfn);
 
 #ifdef CONFIG_INTEL_IOMMU_SVM
@@ -757,7 +808,6 @@ struct intel_svm_dev {
 	struct device *dev;
 	struct intel_iommu *iommu;
 	struct iommu_sva sva;
-	unsigned long prq_seq_number;
 	u32 pasid;
 	int users;
 	u16 did;
@@ -784,7 +834,6 @@ static inline void intel_iommu_debugfs_init(void) {}
 #endif /* CONFIG_INTEL_IOMMU_DEBUGFS */
 
 extern const struct attribute_group *intel_iommu_groups[];
-bool context_present(struct context_entry *context);
 struct context_entry *iommu_context_addr(struct intel_iommu *iommu, u8 bus,
 					 u8 devfn, int alloc);
 

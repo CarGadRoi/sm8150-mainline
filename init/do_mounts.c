@@ -296,7 +296,7 @@ EXPORT_SYMBOL_GPL(name_to_dev_t);
 
 static int __init root_dev_setup(char *line)
 {
-	strlcpy(saved_root_name, line, sizeof(saved_root_name));
+	strscpy(saved_root_name, line, sizeof(saved_root_name));
 	return 1;
 }
 
@@ -343,7 +343,7 @@ static int __init split_fs_names(char *page, size_t size, char *names)
 	int count = 1;
 	char *p = page;
 
-	strlcpy(p, root_fs_names, size);
+	strscpy(p, root_fs_names, size);
 	while (*p++) {
 		if (p[-1] == ',') {
 			p[-1] = '\0';
@@ -665,7 +665,10 @@ struct file_system_type rootfs_fs_type = {
 
 void __init init_rootfs(void)
 {
-	if (IS_ENABLED(CONFIG_TMPFS) && !saved_root_name[0] &&
-		(!root_fs_names || strstr(root_fs_names, "tmpfs")))
-		is_tmpfs = true;
+	if (IS_ENABLED(CONFIG_TMPFS)) {
+		if (!saved_root_name[0] && !root_fs_names)
+			is_tmpfs = true;
+		else if (root_fs_names && !!strstr(root_fs_names, "tmpfs"))
+			is_tmpfs = true;
+	}
 }

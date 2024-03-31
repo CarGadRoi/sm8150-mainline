@@ -30,6 +30,7 @@
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
 #include <linux/log2.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/nls.h>
 #include <linux/seq_file.h>
@@ -390,7 +391,7 @@ static int ntfs_fs_reconfigure(struct fs_context *fc)
 		return -EINVAL;
 	}
 
-	memcpy(sbi->options, new_opts, sizeof(*new_opts));
+	swap(sbi->options, fc->fs_private);
 
 	return 0;
 }
@@ -671,7 +672,7 @@ static u32 true_sectors_per_clst(const struct NTFS_BOOT *boot)
 	if (boot->sectors_per_clusters <= 0x80)
 		return boot->sectors_per_clusters;
 	if (boot->sectors_per_clusters >= 0xf4) /* limit shift to 2MB max */
-		return 1U << (0 - boot->sectors_per_clusters);
+		return 1U << -(s8)boot->sectors_per_clusters;
 	return -EINVAL;
 }
 
@@ -788,7 +789,7 @@ static int ntfs_init_from_boot(struct super_block *sb, u32 sector_size,
 						 : (u32)boot->record_size
 							   << sbi->cluster_bits;
 
-	if (record_size > MAXIMUM_BYTES_PER_MFT)
+	if (record_size > MAXIMUM_BYTES_PER_MFT || record_size < SECTOR_SIZE)
 		goto out;
 
 	sbi->record_bits = blksize_bits(record_size);
@@ -870,6 +871,13 @@ static int ntfs_init_from_boot(struct super_block *sb, u32 sector_size,
 	sb->s_maxbytes = 0xFFFFFFFFull << sbi->cluster_bits;
 #endif
 
+	/*
+	 * Compute the MFT zone at two steps.
+	 * It would be nice if we are able to allocate 1/8 of
+	 * total clusters for MFT but not more then 512 MB.
+	 */
+	sbi->zone_max = min_t(CLST, 0x20000000 >> sbi->cluster_bits, clusters >> 3);
+
 	err = 0;
 
 out:
@@ -900,6 +908,8 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	ref.high = 0;
 
 	sbi->sb = sb;
+	sbi->options = fc->fs_private;
+	fc->fs_private = NULL;
 	sb->s_flags |= SB_NODIRATIME;
 	sb->s_magic = 0x7366746e; // "ntfs"
 	sb->s_op = &ntfs_sops;
@@ -1131,7 +1141,7 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto put_inode_out;
 	}
 	bytes = inode->i_size;
-	sbi->def_table = t = kmalloc(bytes, GFP_NOFS);
+	sbi->def_table = t = kvmalloc(bytes, GFP_KERNEL);
 	if (!t) {
 		err = -ENOMEM;
 		goto put_inode_out;
@@ -1250,9 +1260,9 @@ load_root:
 	ref.low = cpu_to_le32(MFT_REC_ROOT);
 	ref.seq = cpu_to_le16(MFT_REC_ROOT);
 	inode = ntfs_iget5(sb, &ref, &NAME_ROOT);
-	if (IS_ERR(inode)) {
+	if (IS_ERR(inode) || !inode->i_op) {
 		ntfs_err(sb, "Failed to load root.");
-		err = PTR_ERR(inode);
+		err = IS_ERR(inode) ? PTR_ERR(inode) : -EINVAL;
 		goto out;
 	}
 
@@ -1261,8 +1271,6 @@ load_root:
 		err = -ENOMEM;
 		goto put_inode_out;
 	}
-
-	fc->fs_private = NULL;
 
 	return 0;
 
@@ -1273,6 +1281,7 @@ out:
 	 * Free resources here.
 	 * ntfs_fs_free will be called with fc->s_fs_info = NULL
 	 */
+	put_mount_options(sbi->options);
 	put_ntfs(sbi);
 	sb->s_fs_info = NULL;
 
@@ -1378,7 +1387,7 @@ static const struct fs_context_operations ntfs_context_ops = {
 /*
  * ntfs_init_fs_context - Initialize spi and opts
  *
- * This will called when mount/remount. We will first initiliaze
+ * This will called when mount/remount. We will first initialize
  * options so that if remount we can use just that.
  */
 static int ntfs_init_fs_context(struct fs_context *fc)
@@ -1416,7 +1425,6 @@ static int ntfs_init_fs_context(struct fs_context *fc)
 	mutex_init(&sbi->compress.mtx_lzx);
 #endif
 
-	sbi->options = opts;
 	fc->s_fs_info = sbi;
 ok:
 	fc->fs_private = opts;

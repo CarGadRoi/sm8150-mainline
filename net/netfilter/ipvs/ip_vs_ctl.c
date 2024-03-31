@@ -1798,6 +1798,7 @@ static int
 proc_do_sync_threshold(struct ctl_table *table, int write,
 		       void *buffer, size_t *lenp, loff_t *ppos)
 {
+	struct netns_ipvs *ipvs = table->extra2;
 	int *valp = table->data;
 	int val[2];
 	int rc;
@@ -1807,6 +1808,7 @@ proc_do_sync_threshold(struct ctl_table *table, int write,
 		.mode = table->mode,
 	};
 
+	mutex_lock(&ipvs->sync_mutex);
 	memcpy(val, valp, sizeof(val));
 	rc = proc_dointvec(&tmp, write, buffer, lenp, ppos);
 	if (write) {
@@ -1816,6 +1818,7 @@ proc_do_sync_threshold(struct ctl_table *table, int write,
 		else
 			memcpy(valp, val, sizeof(val));
 	}
+	mutex_unlock(&ipvs->sync_mutex);
 	return rc;
 }
 
@@ -2297,11 +2300,11 @@ static int ip_vs_stats_percpu_show(struct seq_file *seq, void *v)
 
 		do {
 			start = u64_stats_fetch_begin_irq(&u->syncp);
-			conns = u->cnt.conns;
-			inpkts = u->cnt.inpkts;
-			outpkts = u->cnt.outpkts;
-			inbytes = u->cnt.inbytes;
-			outbytes = u->cnt.outbytes;
+			conns = u64_stats_read(&u->cnt.conns);
+			inpkts = u64_stats_read(&u->cnt.inpkts);
+			outpkts = u64_stats_read(&u->cnt.outpkts);
+			inbytes = u64_stats_read(&u->cnt.inbytes);
+			outbytes = u64_stats_read(&u->cnt.outbytes);
 		} while (u64_stats_fetch_retry_irq(&u->syncp, start));
 
 		seq_printf(seq, "%3X %8LX %8LX %8LX %16LX %16LX\n",
@@ -2611,7 +2614,7 @@ ip_vs_copy_service(struct ip_vs_service_entry *dst, struct ip_vs_service *src)
 	dst->addr = src->addr.ip;
 	dst->port = src->port;
 	dst->fwmark = src->fwmark;
-	strlcpy(dst->sched_name, sched_name, sizeof(dst->sched_name));
+	strscpy(dst->sched_name, sched_name, sizeof(dst->sched_name));
 	dst->flags = src->flags;
 	dst->timeout = src->timeout / HZ;
 	dst->netmask = src->netmask;
@@ -2805,13 +2808,13 @@ do_ip_vs_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 		mutex_lock(&ipvs->sync_mutex);
 		if (ipvs->sync_state & IP_VS_STATE_MASTER) {
 			d[0].state = IP_VS_STATE_MASTER;
-			strlcpy(d[0].mcast_ifn, ipvs->mcfg.mcast_ifn,
+			strscpy(d[0].mcast_ifn, ipvs->mcfg.mcast_ifn,
 				sizeof(d[0].mcast_ifn));
 			d[0].syncid = ipvs->mcfg.syncid;
 		}
 		if (ipvs->sync_state & IP_VS_STATE_BACKUP) {
 			d[1].state = IP_VS_STATE_BACKUP;
-			strlcpy(d[1].mcast_ifn, ipvs->bcfg.mcast_ifn,
+			strscpy(d[1].mcast_ifn, ipvs->bcfg.mcast_ifn,
 				sizeof(d[1].mcast_ifn));
 			d[1].syncid = ipvs->bcfg.syncid;
 		}
@@ -3561,7 +3564,7 @@ static int ip_vs_genl_new_daemon(struct netns_ipvs *ipvs, struct nlattr **attrs)
 	      attrs[IPVS_DAEMON_ATTR_MCAST_IFN] &&
 	      attrs[IPVS_DAEMON_ATTR_SYNC_ID]))
 		return -EINVAL;
-	strlcpy(c.mcast_ifn, nla_data(attrs[IPVS_DAEMON_ATTR_MCAST_IFN]),
+	strscpy(c.mcast_ifn, nla_data(attrs[IPVS_DAEMON_ATTR_MCAST_IFN]),
 		sizeof(c.mcast_ifn));
 	c.syncid = nla_get_u32(attrs[IPVS_DAEMON_ATTR_SYNC_ID]);
 
@@ -4005,6 +4008,7 @@ static struct genl_family ip_vs_genl_family __ro_after_init = {
 	.module		= THIS_MODULE,
 	.small_ops	= ip_vs_genl_ops,
 	.n_small_ops	= ARRAY_SIZE(ip_vs_genl_ops),
+	.resv_start_op	= IPVS_CMD_FLUSH + 1,
 };
 
 static int __init ip_vs_genl_register(void)
@@ -4079,6 +4083,7 @@ static int __net_init ip_vs_control_net_init_sysctl(struct netns_ipvs *ipvs)
 	ipvs->sysctl_sync_threshold[0] = DEFAULT_SYNC_THRESHOLD;
 	ipvs->sysctl_sync_threshold[1] = DEFAULT_SYNC_PERIOD;
 	tbl[idx].data = &ipvs->sysctl_sync_threshold;
+	tbl[idx].extra2 = ipvs;
 	tbl[idx++].maxlen = sizeof(ipvs->sysctl_sync_threshold);
 	ipvs->sysctl_sync_refresh_period = DEFAULT_SYNC_REFRESH_PERIOD;
 	tbl[idx++].data = &ipvs->sysctl_sync_refresh_period;

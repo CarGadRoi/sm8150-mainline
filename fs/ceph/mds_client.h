@@ -31,8 +31,9 @@ enum ceph_feature_type {
 	CEPHFS_FEATURE_METRIC_COLLECT,
 	CEPHFS_FEATURE_ALTERNATE_NAME,
 	CEPHFS_FEATURE_NOTIFY_SESSION_STATE,
+	CEPHFS_FEATURE_OP_GETVXATTR,
 
-	CEPHFS_FEATURE_MAX = CEPHFS_FEATURE_NOTIFY_SESSION_STATE,
+	CEPHFS_FEATURE_MAX = CEPHFS_FEATURE_OP_GETVXATTR,
 };
 
 #define CEPHFS_FEATURES_CLIENT_SUPPORTED {	\
@@ -44,6 +45,7 @@ enum ceph_feature_type {
 	CEPHFS_FEATURE_DELEG_INO,		\
 	CEPHFS_FEATURE_METRIC_COLLECT,		\
 	CEPHFS_FEATURE_NOTIFY_SESSION_STATE,	\
+	CEPHFS_FEATURE_OP_GETVXATTR,		\
 }
 
 /*
@@ -336,6 +338,8 @@ struct ceph_mds_request {
 	long long	  r_dir_ordered_cnt;
 	int		  r_readdir_cache_idx;
 
+	int		  r_feature_needed;
+
 	struct ceph_cap_reservation r_caps_reservation;
 };
 
@@ -376,6 +380,12 @@ struct cap_wait {
 	int			want;
 };
 
+enum {
+	CEPH_MDSC_STOPPING_BEGIN = 1,
+	CEPH_MDSC_STOPPING_FLUSHING = 2,
+	CEPH_MDSC_STOPPING_FLUSHED = 3,
+};
+
 /*
  * mds client state
  */
@@ -392,7 +402,11 @@ struct ceph_mds_client {
 	struct ceph_mds_session **sessions;    /* NULL for mds if no session */
 	atomic_t		num_sessions;
 	int                     max_sessions;  /* len of sessions array */
-	int                     stopping;      /* true if shutting down */
+
+	spinlock_t              stopping_lock;  /* protect snap_empty */
+	int                     stopping;      /* the stage of shutting down */
+	atomic_t                stopping_blockers;
+	struct completion	stopping_waiter;
 
 	atomic64_t		quotarealms_count; /* # realms with quota */
 	/*
@@ -537,8 +551,7 @@ extern void ceph_flush_cap_releases(struct ceph_mds_client *mdsc,
 extern void ceph_queue_cap_reclaim_work(struct ceph_mds_client *mdsc);
 extern void ceph_reclaim_caps_nr(struct ceph_mds_client *mdsc, int nr);
 extern int ceph_iterate_session_caps(struct ceph_mds_session *session,
-				     int (*cb)(struct inode *,
-					       struct ceph_cap *, void *),
+				     int (*cb)(struct inode *, int mds, void *),
 				     void *arg);
 extern void ceph_mdsc_pre_umount(struct ceph_mds_client *mdsc);
 

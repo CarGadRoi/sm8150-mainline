@@ -112,6 +112,8 @@ static int kd35t133_unprepare(struct drm_panel *panel)
 		return ret;
 	}
 
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+
 	regulator_disable(ctx->iovcc);
 	regulator_disable(ctx->vdd);
 
@@ -321,7 +323,7 @@ static void kd35t133_shutdown(struct mipi_dsi_device *dsi)
 		dev_err(&dsi->dev, "Failed to disable panel: %d\n", ret);
 }
 
-static int kd35t133_remove(struct mipi_dsi_device *dsi)
+static void kd35t133_remove(struct mipi_dsi_device *dsi)
 {
 	struct kd35t133 *ctx = mipi_dsi_get_drvdata(dsi);
 	int ret;
@@ -333,8 +335,6 @@ static int kd35t133_remove(struct mipi_dsi_device *dsi)
 		dev_err(&dsi->dev, "Failed to detach from DSI host: %d\n", ret);
 
 	drm_panel_remove(&ctx->panel);
-
-	return 0;
 }
 
 static const struct of_device_id kd35t133_of_match[] = {

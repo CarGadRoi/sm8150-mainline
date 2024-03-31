@@ -1045,10 +1045,12 @@ static int min_key_size_set(void *data, u64 val)
 {
 	struct hci_dev *hdev = data;
 
-	if (val > hdev->le_max_key_size || val < SMP_MIN_ENC_KEY_SIZE)
-		return -EINVAL;
-
 	hci_dev_lock(hdev);
+	if (val > hdev->le_max_key_size || val < SMP_MIN_ENC_KEY_SIZE) {
+		hci_dev_unlock(hdev);
+		return -EINVAL;
+	}
+
 	hdev->le_min_key_size = val;
 	hci_dev_unlock(hdev);
 
@@ -1073,10 +1075,12 @@ static int max_key_size_set(void *data, u64 val)
 {
 	struct hci_dev *hdev = data;
 
-	if (val > SMP_MAX_ENC_KEY_SIZE || val < hdev->le_min_key_size)
-		return -EINVAL;
-
 	hci_dev_lock(hdev);
+	if (val > SMP_MAX_ENC_KEY_SIZE || val < hdev->le_min_key_size) {
+		hci_dev_unlock(hdev);
+		return -EINVAL;
+	}
+
 	hdev->le_max_key_size = val;
 	hci_dev_unlock(hdev);
 
@@ -1245,7 +1249,7 @@ void hci_debugfs_create_conn(struct hci_conn *conn)
 	struct hci_dev *hdev = conn->hdev;
 	char name[6];
 
-	if (IS_ERR_OR_NULL(hdev->debugfs))
+	if (IS_ERR_OR_NULL(hdev->debugfs) || conn->debugfs)
 		return;
 
 	snprintf(name, sizeof(name), "%u", conn->handle);

@@ -39,7 +39,7 @@ static inline struct pscsi_dev_virt *PSCSI_DEV(struct se_device *dev)
 }
 
 static sense_reason_t pscsi_execute_cmd(struct se_cmd *cmd);
-static void pscsi_req_done(struct request *, blk_status_t);
+static enum rq_end_io_ret pscsi_req_done(struct request *, blk_status_t);
 
 /*	pscsi_attach_hba():
  *
@@ -500,7 +500,7 @@ static int pscsi_configure_device(struct se_device *dev)
 			continue;
 		/*
 		 * Functions will release the held struct scsi_host->host_lock
-		 * before calling calling pscsi_add_device_to_list() to register
+		 * before calling pscsi_add_device_to_list() to register
 		 * struct scsi_device with target_core_mod.
 		 */
 		switch (sd->type) {
@@ -910,12 +910,15 @@ new_bio:
 
 	return 0;
 fail:
-	if (bio)
-		bio_put(bio);
+	if (bio) {
+		bio_uninit(bio);
+		kfree(bio);
+	}
 	while (req->bio) {
 		bio = req->bio;
 		req->bio = bio->bi_next;
-		bio_put(bio);
+		bio_uninit(bio);
+		kfree(bio);
 	}
 	req->biotail = NULL;
 	return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
@@ -1002,7 +1005,8 @@ static sector_t pscsi_get_blocks(struct se_device *dev)
 	return 0;
 }
 
-static void pscsi_req_done(struct request *req, blk_status_t status)
+static enum rq_end_io_ret pscsi_req_done(struct request *req,
+					 blk_status_t status)
 {
 	struct se_cmd *cmd = req->end_io_data;
 	struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(req);
@@ -1029,6 +1033,7 @@ static void pscsi_req_done(struct request *req, blk_status_t status)
 	}
 
 	blk_mq_free_request(req);
+	return RQ_END_IO_NONE;
 }
 
 static const struct target_backend_ops pscsi_ops = {

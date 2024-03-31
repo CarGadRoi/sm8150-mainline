@@ -1041,12 +1041,12 @@ static int wpcm450_gpio_register(struct platform_device *pdev,
 		if (ret < 0)
 			return ret;
 
-		gpio = &pctrl->gpio_bank[reg];
-		gpio->pctrl = pctrl;
-
 		if (reg >= WPCM450_NUM_BANKS)
 			return dev_err_probe(dev, -EINVAL,
 					     "GPIO index %d out of range!\n", reg);
+
+		gpio = &pctrl->gpio_bank[reg];
+		gpio->pctrl = pctrl;
 
 		bank = &wpcm450_banks[reg];
 		gpio->bank = bank;
@@ -1081,10 +1081,13 @@ static int wpcm450_gpio_register(struct platform_device *pdev,
 
 		girq->num_parents = 0;
 		for (i = 0; i < WPCM450_NUM_GPIO_IRQS; i++) {
-			int irq = fwnode_irq_get(child, i);
+			int irq;
 
+			irq = fwnode_irq_get(child, i);
 			if (irq < 0)
 				break;
+			if (!irq)
+				continue;
 
 			girq->parents[i] = irq;
 			girq->num_parents++;

@@ -108,7 +108,7 @@ static ssize_t aoedisk_show_payload(struct device *dev,
 	return sysfs_emit(page, "%lu\n", d->maxbcnt);
 }
 
-static int aoedisk_debugfs_show(struct seq_file *s, void *ignored)
+static int aoe_debugfs_show(struct seq_file *s, void *ignored)
 {
 	struct aoedev *d;
 	struct aoetgt **t, **te;
@@ -151,11 +151,7 @@ static int aoedisk_debugfs_show(struct seq_file *s, void *ignored)
 
 	return 0;
 }
-
-static int aoe_debugfs_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, aoedisk_debugfs_show, inode->i_private);
-}
+DEFINE_SHOW_ATTRIBUTE(aoe_debugfs);
 
 static DEVICE_ATTR(state, 0444, aoedisk_show_state, NULL);
 static DEVICE_ATTR(mac, 0444, aoedisk_show_mac, NULL);
@@ -182,13 +178,6 @@ static const struct attribute_group aoe_attr_group = {
 static const struct attribute_group *aoe_attr_groups[] = {
 	&aoe_attr_group,
 	NULL,
-};
-
-static const struct file_operations aoe_debugfs_fops = {
-	.open = aoe_debugfs_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
 };
 
 static void
@@ -344,6 +333,7 @@ aoeblk_gdalloc(void *vp)
 	struct gendisk *gd;
 	mempool_t *mp;
 	struct blk_mq_tag_set *set;
+	sector_t ssize;
 	ulong flags;
 	int late = 0;
 	int err;
@@ -406,7 +396,7 @@ aoeblk_gdalloc(void *vp)
 	gd->minors = AOE_PARTITIONS;
 	gd->fops = &aoe_bdops;
 	gd->private_data = d;
-	set_capacity(gd, d->ssize);
+	ssize = d->ssize;
 	snprintf(gd->disk_name, sizeof gd->disk_name, "etherd/e%ld.%d",
 		d->aoemajor, d->aoeminor);
 
@@ -414,6 +404,8 @@ aoeblk_gdalloc(void *vp)
 	d->flags |= DEVFL_UP;
 
 	spin_unlock_irqrestore(&d->lock, flags);
+
+	set_capacity(gd, ssize);
 
 	err = device_add_disk(NULL, gd, aoe_attr_groups);
 	if (err)

@@ -114,6 +114,22 @@ noinline void btrfs_release_path(struct btrfs_path *p)
 }
 
 /*
+ * We want the transaction abort to print stack trace only for errors where the
+ * cause could be a bug, eg. due to ENOSPC, and not for common errors that are
+ * caused by external factors.
+ */
+bool __cold abort_should_print_stack(int errno)
+{
+	switch (errno) {
+	case -EIO:
+	case -EROFS:
+	case -ENOMEM:
+		return false;
+	}
+	return true;
+}
+
+/*
  * safely gets a reference on the root node of a tree.  A lock
  * is not taken, so a concurrent writer may put a different node
  * at the root of the tree.  See btrfs_lock_root_node for the
@@ -459,9 +475,14 @@ static noinline int __btrfs_cow_block(struct btrfs_trans_handle *trans,
 		    btrfs_header_backref_rev(buf) < BTRFS_MIXED_BACKREF_REV)
 			parent_start = buf->start;
 
-		atomic_inc(&cow->refs);
 		ret = btrfs_tree_mod_log_insert_root(root->node, cow, true);
-		BUG_ON(ret < 0);
+		if (ret < 0) {
+			btrfs_tree_unlock(cow);
+			free_extent_buffer(cow);
+			btrfs_abort_transaction(trans, ret);
+			return ret;
+		}
+		atomic_inc(&cow->refs);
 		rcu_assign_pointer(root->node, cow);
 
 		btrfs_free_tree_block(trans, btrfs_root_id(root), buf,
@@ -542,18 +563,30 @@ noinline int btrfs_cow_block(struct btrfs_trans_handle *trans,
 	u64 search_start;
 	int ret;
 
-	if (test_bit(BTRFS_ROOT_DELETING, &root->state))
-		btrfs_err(fs_info,
-			"COW'ing blocks on a fs root that's being dropped");
+	if (unlikely(test_bit(BTRFS_ROOT_DELETING, &root->state))) {
+		btrfs_abort_transaction(trans, -EUCLEAN);
+		btrfs_crit(fs_info,
+		   "attempt to COW block %llu on root %llu that is being deleted",
+			   buf->start, btrfs_root_id(root));
+		return -EUCLEAN;
+	}
 
-	if (trans->transaction != fs_info->running_transaction)
-		WARN(1, KERN_CRIT "trans %llu running %llu\n",
-		       trans->transid,
-		       fs_info->running_transaction->transid);
-
-	if (trans->transid != fs_info->generation)
-		WARN(1, KERN_CRIT "trans %llu running %llu\n",
-		       trans->transid, fs_info->generation);
+	/*
+	 * COWing must happen through a running transaction, which always
+	 * matches the current fs generation (it's a transaction with a state
+	 * less than TRANS_STATE_UNBLOCKED). If it doesn't, then turn the fs
+	 * into error state to prevent the commit of any transaction.
+	 */
+	if (unlikely(trans->transaction != fs_info->running_transaction ||
+		     trans->transid != fs_info->generation)) {
+		btrfs_abort_transaction(trans, -EUCLEAN);
+		btrfs_crit(fs_info,
+"unexpected transaction when attempting to COW block %llu on root %llu, transaction %llu running transaction %llu fs generation %llu",
+			   buf->start, btrfs_root_id(root), trans->transid,
+			   fs_info->running_transaction->transid,
+			   fs_info->generation);
+		return -EUCLEAN;
+	}
 
 	if (!should_cow_block(trans, root, buf)) {
 		*cow_ret = buf;
@@ -665,8 +698,22 @@ int btrfs_realloc_node(struct btrfs_trans_handle *trans,
 	int progress_passed = 0;
 	struct btrfs_disk_key disk_key;
 
-	WARN_ON(trans->transaction != fs_info->running_transaction);
-	WARN_ON(trans->transid != fs_info->generation);
+	/*
+	 * COWing must happen through a running transaction, which always
+	 * matches the current fs generation (it's a transaction with a state
+	 * less than TRANS_STATE_UNBLOCKED). If it doesn't, then turn the fs
+	 * into error state to prevent the commit of any transaction.
+	 */
+	if (unlikely(trans->transaction != fs_info->running_transaction ||
+		     trans->transid != fs_info->generation)) {
+		btrfs_abort_transaction(trans, -EUCLEAN);
+		btrfs_crit(fs_info,
+"unexpected transaction when attempting to reallocate parent %llu for root %llu, transaction %llu running transaction %llu fs generation %llu",
+			   parent->start, btrfs_root_id(root), trans->transid,
+			   fs_info->running_transaction->transid,
+			   fs_info->generation);
+		return -EUCLEAN;
+	}
 
 	parent_nritems = btrfs_header_nritems(parent);
 	blocksize = fs_info->nodesize;
@@ -919,7 +966,12 @@ static noinline int balance_level(struct btrfs_trans_handle *trans,
 		}
 
 		ret = btrfs_tree_mod_log_insert_root(root->node, child, true);
-		BUG_ON(ret < 0);
+		if (ret < 0) {
+			btrfs_tree_unlock(child);
+			free_extent_buffer(child);
+			btrfs_abort_transaction(trans, ret);
+			goto enospc;
+		}
 		rcu_assign_pointer(root->node, child);
 
 		add_root_to_dirty_list(root);
@@ -1001,7 +1053,10 @@ static noinline int balance_level(struct btrfs_trans_handle *trans,
 			btrfs_node_key(right, &right_key, 0);
 			ret = btrfs_tree_mod_log_insert_key(parent, pslot + 1,
 					BTRFS_MOD_LOG_KEY_REPLACE, GFP_NOFS);
-			BUG_ON(ret < 0);
+			if (ret < 0) {
+				btrfs_abort_transaction(trans, ret);
+				goto enospc;
+			}
 			btrfs_set_node_key(parent, &right_key, pslot + 1);
 			btrfs_mark_buffer_dirty(parent);
 		}
@@ -1047,7 +1102,10 @@ static noinline int balance_level(struct btrfs_trans_handle *trans,
 		btrfs_node_key(mid, &mid_key, 0);
 		ret = btrfs_tree_mod_log_insert_key(parent, pslot,
 				BTRFS_MOD_LOG_KEY_REPLACE, GFP_NOFS);
-		BUG_ON(ret < 0);
+		if (ret < 0) {
+			btrfs_abort_transaction(trans, ret);
+			goto enospc;
+		}
 		btrfs_set_node_key(parent, &mid_key, pslot);
 		btrfs_mark_buffer_dirty(parent);
 	}
@@ -1447,6 +1505,11 @@ read_block_for_search(struct btrfs_root *root, struct btrfs_path *p,
 			return 0;
 		}
 
+		if (p->nowait) {
+			free_extent_buffer(tmp);
+			return -EAGAIN;
+		}
+
 		if (unlock_up)
 			btrfs_unlock_up_safe(p, level + 1);
 
@@ -1467,6 +1530,8 @@ read_block_for_search(struct btrfs_root *root, struct btrfs_path *p,
 			ret = -EAGAIN;
 
 		goto out;
+	} else if (p->nowait) {
+		return -EAGAIN;
 	}
 
 	if (unlock_up) {
@@ -1634,7 +1699,13 @@ static struct extent_buffer *btrfs_search_slot_get_root(struct btrfs_root *root,
 		 * We don't know the level of the root node until we actually
 		 * have it read locked
 		 */
-		b = btrfs_read_lock_root_node(root);
+		if (p->nowait) {
+			b = btrfs_try_read_lock_root_node(root);
+			if (IS_ERR(b))
+				return b;
+		} else {
+			b = btrfs_read_lock_root_node(root);
+		}
 		level = btrfs_header_level(b);
 		if (level > write_lock_level)
 			goto out;
@@ -1910,6 +1981,13 @@ int btrfs_search_slot(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 	WARN_ON(p->nodes[0] != NULL);
 	BUG_ON(!cow && ins_len);
 
+	/*
+	 * For now only allow nowait for read only operations.  There's no
+	 * strict reason why we can't, we just only need it for reads so it's
+	 * only implemented for reads.
+	 */
+	ASSERT(!p->nowait || !cow);
+
 	if (ins_len < 0) {
 		lowest_unlock = 2;
 
@@ -1936,7 +2014,12 @@ int btrfs_search_slot(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 
 	if (p->need_commit_sem) {
 		ASSERT(p->search_commit_root);
-		down_read(&fs_info->commit_root_sem);
+		if (p->nowait) {
+			if (!down_read_trylock(&fs_info->commit_root_sem))
+				return -EAGAIN;
+		} else {
+			down_read(&fs_info->commit_root_sem);
+		}
 	}
 
 again:
@@ -2075,11 +2158,22 @@ cow_done:
 
 		if (!p->skip_locking) {
 			level = btrfs_header_level(b);
+
+			btrfs_maybe_reset_lockdep_class(root, b);
+
 			if (level <= write_lock_level) {
 				btrfs_tree_lock(b);
 				p->locks[level] = BTRFS_WRITE_LOCK;
 			} else {
-				btrfs_tree_read_lock(b);
+				if (p->nowait) {
+					if (!btrfs_try_tree_read_lock(b)) {
+						free_extent_buffer(b);
+						ret = -EAGAIN;
+						goto done;
+					}
+				} else {
+					btrfs_tree_read_lock(b);
+				}
 				p->locks[level] = BTRFS_READ_LOCK;
 			}
 			p->nodes[level] = b;
@@ -2128,6 +2222,7 @@ int btrfs_search_old_slot(struct btrfs_root *root, const struct btrfs_key *key,
 
 	lowest_level = p->lowest_level;
 	WARN_ON(p->nodes[0] != NULL);
+	ASSERT(!p->nowait);
 
 	if (p->search_commit_root) {
 		BUG_ON(time_seq);
@@ -2797,6 +2892,8 @@ static noinline int split_node(struct btrfs_trans_handle *trans,
 
 	ret = btrfs_tree_mod_log_eb_copy(split, c, 0, mid, c_nritems - mid);
 	if (ret) {
+		btrfs_tree_unlock(split);
+		free_extent_buffer(split);
 		btrfs_abort_transaction(trans, ret);
 		return ret;
 	}
@@ -3065,6 +3162,7 @@ static int push_leaf_right(struct btrfs_trans_handle *trans, struct btrfs_root
 
 	if (check_sibling_keys(left, right)) {
 		ret = -EUCLEAN;
+		btrfs_abort_transaction(trans, ret);
 		btrfs_tree_unlock(right);
 		free_extent_buffer(right);
 		return ret;
@@ -3295,6 +3393,7 @@ static int push_leaf_left(struct btrfs_trans_handle *trans, struct btrfs_root
 
 	if (check_sibling_keys(left, right)) {
 		ret = -EUCLEAN;
+		btrfs_abort_transaction(trans, ret);
 		goto out;
 	}
 	return __push_leaf_left(path, min_data_size,
@@ -4358,10 +4457,12 @@ int btrfs_del_items(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 int btrfs_prev_leaf(struct btrfs_root *root, struct btrfs_path *path)
 {
 	struct btrfs_key key;
+	struct btrfs_key orig_key;
 	struct btrfs_disk_key found_key;
 	int ret;
 
 	btrfs_item_key_to_cpu(path->nodes[0], &key, 0);
+	orig_key = key;
 
 	if (key.offset > 0) {
 		key.offset--;
@@ -4378,8 +4479,36 @@ int btrfs_prev_leaf(struct btrfs_root *root, struct btrfs_path *path)
 
 	btrfs_release_path(path);
 	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
-	if (ret < 0)
+	if (ret <= 0)
 		return ret;
+
+	/*
+	 * Previous key not found. Even if we were at slot 0 of the leaf we had
+	 * before releasing the path and calling btrfs_search_slot(), we now may
+	 * be in a slot pointing to the same original key - this can happen if
+	 * after we released the path, one of more items were moved from a
+	 * sibling leaf into the front of the leaf we had due to an insertion
+	 * (see push_leaf_right()).
+	 * If we hit this case and our slot is > 0 and just decrement the slot
+	 * so that the caller does not process the same key again, which may or
+	 * may not break the caller, depending on its logic.
+	 */
+	if (path->slots[0] < btrfs_header_nritems(path->nodes[0])) {
+		btrfs_item_key(path->nodes[0], &found_key, path->slots[0]);
+		ret = comp_keys(&found_key, &orig_key);
+		if (ret == 0) {
+			if (path->slots[0] > 0) {
+				path->slots[0]--;
+				return 0;
+			}
+			/*
+			 * At slot 0, same key as before, it means orig_key is
+			 * the lowest, leftmost, key in the tree. We're done.
+			 */
+			return 1;
+		}
+	}
+
 	btrfs_item_key(path->nodes[0], &found_key, 0);
 	ret = comp_keys(&found_key, &key);
 	/*
@@ -4429,6 +4558,7 @@ int btrfs_search_forward(struct btrfs_root *root, struct btrfs_key *min_key,
 	int ret = 1;
 	int keep_locks = path->keep_locks;
 
+	ASSERT(!path->nowait);
 	path->keep_locks = 1;
 again:
 	cur = btrfs_read_lock_root_node(root);
@@ -4609,6 +4739,13 @@ int btrfs_next_old_leaf(struct btrfs_root *root, struct btrfs_path *path,
 	int ret;
 	int i;
 
+	/*
+	 * The nowait semantics are used only for write paths, where we don't
+	 * use the tree mod log and sequence numbers.
+	 */
+	if (time_seq)
+		ASSERT(!path->nowait);
+
 	nritems = btrfs_header_nritems(path->nodes[0]);
 	if (nritems == 0)
 		return 1;
@@ -4627,7 +4764,14 @@ again:
 		if (path->need_commit_sem) {
 			path->need_commit_sem = 0;
 			need_commit_sem = true;
-			down_read(&fs_info->commit_root_sem);
+			if (path->nowait) {
+				if (!down_read_trylock(&fs_info->commit_root_sem)) {
+					ret = -EAGAIN;
+					goto done;
+				}
+			} else {
+				down_read(&fs_info->commit_root_sem);
+			}
 		}
 		ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
 	}
@@ -4703,7 +4847,7 @@ again:
 		next = c;
 		ret = read_block_for_search(root, path, &next, level,
 					    slot, &key);
-		if (ret == -EAGAIN)
+		if (ret == -EAGAIN && !path->nowait)
 			goto again;
 
 		if (ret < 0) {
@@ -4713,6 +4857,10 @@ again:
 
 		if (!path->skip_locking) {
 			ret = btrfs_try_tree_read_lock(next);
+			if (!ret && path->nowait) {
+				ret = -EAGAIN;
+				goto done;
+			}
 			if (!ret && time_seq) {
 				/*
 				 * If we don't get the lock, we may be racing
@@ -4743,7 +4891,7 @@ again:
 
 		ret = read_block_for_search(root, path, &next, level,
 					    0, &key);
-		if (ret == -EAGAIN)
+		if (ret == -EAGAIN && !path->nowait)
 			goto again;
 
 		if (ret < 0) {
@@ -4751,8 +4899,16 @@ again:
 			goto done;
 		}
 
-		if (!path->skip_locking)
-			btrfs_tree_read_lock(next);
+		if (!path->skip_locking) {
+			if (path->nowait) {
+				if (!btrfs_try_tree_read_lock(next)) {
+					ret = -EAGAIN;
+					goto done;
+				}
+			} else {
+				btrfs_tree_read_lock(next);
+			}
+		}
 	}
 	ret = 0;
 done:

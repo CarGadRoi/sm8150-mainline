@@ -14,7 +14,7 @@ static void *erofs_read_inode(struct erofs_buf *buf,
 	struct super_block *sb = inode->i_sb;
 	struct erofs_sb_info *sbi = EROFS_SB(sb);
 	struct erofs_inode *vi = EROFS_I(inode);
-	const erofs_off_t inode_loc = iloc(sbi, vi->nid);
+	const erofs_off_t inode_loc = erofs_iloc(inode);
 
 	erofs_blk_t blkaddr, nblks = 0;
 	void *kaddr;
@@ -186,7 +186,8 @@ static void *erofs_read_inode(struct erofs_buf *buf,
 
 	inode->i_flags &= ~S_DAX;
 	if (test_opt(&sbi->opt, DAX_ALWAYS) && S_ISREG(inode->i_mode) &&
-	    vi->datalayout == EROFS_INODE_FLAT_PLAIN)
+	    (vi->datalayout == EROFS_INODE_FLAT_PLAIN ||
+	     vi->datalayout == EROFS_INODE_CHUNK_BASED))
 		inode->i_flags |= S_DAX;
 	if (!nblks)
 		/* measure inode.i_blocks as generic filesystems */
@@ -214,7 +215,7 @@ static int erofs_fill_symlink(struct inode *inode, void *kaddr,
 
 	/* if it cannot be handled with fast symlink scheme */
 	if (vi->datalayout != EROFS_INODE_FLAT_INLINE ||
-	    inode->i_size >= EROFS_BLKSIZ) {
+	    inode->i_size >= EROFS_BLKSIZ || inode->i_size < 0) {
 		inode->i_op = &erofs_symlink_iops;
 		return 0;
 	}
@@ -241,7 +242,7 @@ static int erofs_fill_symlink(struct inode *inode, void *kaddr,
 	return 0;
 }
 
-static int erofs_fill_inode(struct inode *inode, int isdir)
+static int erofs_fill_inode(struct inode *inode)
 {
 	struct erofs_inode *vi = EROFS_I(inode);
 	struct erofs_buf buf = __EROFS_BUF_INITIALIZER;
@@ -249,7 +250,7 @@ static int erofs_fill_inode(struct inode *inode, int isdir)
 	unsigned int ofs;
 	int err = 0;
 
-	trace_erofs_fill_inode(inode, isdir);
+	trace_erofs_fill_inode(inode);
 
 	/* read inode base data from disk */
 	kaddr = erofs_read_inode(&buf, inode, &ofs);
@@ -324,21 +325,13 @@ static int erofs_iget_set_actor(struct inode *inode, void *opaque)
 	return 0;
 }
 
-static inline struct inode *erofs_iget_locked(struct super_block *sb,
-					      erofs_nid_t nid)
+struct inode *erofs_iget(struct super_block *sb, erofs_nid_t nid)
 {
 	const unsigned long hashval = erofs_inode_hash(nid);
+	struct inode *inode;
 
-	return iget5_locked(sb, hashval, erofs_ilookup_test_actor,
+	inode = iget5_locked(sb, hashval, erofs_ilookup_test_actor,
 		erofs_iget_set_actor, &nid);
-}
-
-struct inode *erofs_iget(struct super_block *sb,
-			 erofs_nid_t nid,
-			 bool isdir)
-{
-	struct inode *inode = erofs_iget_locked(sb, nid);
-
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
 
@@ -348,10 +341,10 @@ struct inode *erofs_iget(struct super_block *sb,
 
 		vi->nid = nid;
 
-		err = erofs_fill_inode(inode, isdir);
-		if (!err)
+		err = erofs_fill_inode(inode);
+		if (!err) {
 			unlock_new_inode(inode);
-		else {
+		} else {
 			iget_failed(inode);
 			inode = ERR_PTR(err);
 		}

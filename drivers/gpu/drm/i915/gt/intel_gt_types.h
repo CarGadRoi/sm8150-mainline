@@ -11,6 +11,7 @@
 #include <linux/llist.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
+#include <linux/seqlock.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
@@ -75,15 +76,44 @@ enum intel_submission_method {
 	INTEL_SUBMISSION_GUC,
 };
 
+struct gt_defaults {
+	u32 min_freq;
+	u32 max_freq;
+};
+
+enum intel_gt_type {
+	GT_PRIMARY,
+	GT_TILE,
+	GT_MEDIA,
+};
+
 struct intel_gt {
 	struct drm_i915_private *i915;
+	const char *name;
+	enum intel_gt_type type;
+
 	struct intel_uncore *uncore;
 	struct i915_ggtt *ggtt;
 
 	struct intel_uc uc;
 	struct intel_gsc gsc;
 
-	struct mutex tlb_invalidate_lock;
+	struct {
+		/* Serialize global tlb invalidations */
+		struct mutex invalidate_lock;
+
+		/*
+		 * Batch TLB invalidations
+		 *
+		 * After unbinding the PTE, we need to ensure the TLB
+		 * are invalidated prior to releasing the physical pages.
+		 * But we only need one such invalidation for all unbinds,
+		 * so we track how many TLB invalidations have been
+		 * performed since unbind the PTE and only emit an extra
+		 * invalidate if no full barrier has been passed.
+		 */
+		seqcount_mutex_t seqno;
+	} tlb;
 
 	struct i915_wa_list wa_list;
 
@@ -133,7 +163,7 @@ struct intel_gt {
 	struct intel_rc6 rc6;
 	struct intel_rps rps;
 
-	spinlock_t irq_lock;
+	spinlock_t *irq_lock;
 	u32 gt_imr;
 	u32 pm_ier;
 	u32 pm_imr;
@@ -235,6 +265,18 @@ struct intel_gt {
 
 	/* gt/gtN sysfs */
 	struct kobject sysfs_gt;
+
+	/* sysfs defaults per gt */
+	struct gt_defaults defaults;
+	struct kobject *sysfs_defaults;
+};
+
+struct intel_gt_definition {
+	enum intel_gt_type type;
+	char *name;
+	u32 mapping_base;
+	u32 gsi_offset;
+	intel_engine_mask_t engine_mask;
 };
 
 enum intel_gt_scratch_field {

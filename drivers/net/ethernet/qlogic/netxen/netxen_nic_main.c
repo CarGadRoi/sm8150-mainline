@@ -173,8 +173,7 @@ netxen_napi_add(struct netxen_adapter *adapter, struct net_device *netdev)
 
 	for (ring = 0; ring < adapter->max_sds_rings; ring++) {
 		sds_ring = &recv_ctx->sds_rings[ring];
-		netif_napi_add(netdev, &sds_ring->napi,
-				netxen_nic_poll, NAPI_POLL_WEIGHT);
+		netif_napi_add(netdev, &sds_ring->napi, netxen_nic_poll);
 	}
 
 	return 0;
@@ -1863,7 +1862,7 @@ netxen_tso_check(struct net_device *netdev,
 
 	if (protocol == cpu_to_be16(ETH_P_8021Q)) {
 
-		vh = (struct vlan_ethhdr *)skb->data;
+		vh = skb_vlan_eth_hdr(skb);
 		protocol = vh->h_vlan_encapsulated_proto;
 		flags = FLAGS_VLAN_TAGGED;
 

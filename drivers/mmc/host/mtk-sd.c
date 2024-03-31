@@ -474,6 +474,84 @@ struct msdc_host {
 	struct cqhci_host *cq_host;
 };
 
+static const struct mtk_mmc_compatible mt2701_compat = {
+	.clk_div_bits = 12,
+	.recheck_sdio_irq = true,
+	.hs400_tune = false,
+	.pad_tune_reg = MSDC_PAD_TUNE0,
+	.async_fifo = true,
+	.data_tune = true,
+	.busy_check = false,
+	.stop_clk_fix = false,
+	.enhance_rx = false,
+	.support_64g = false,
+};
+
+static const struct mtk_mmc_compatible mt2712_compat = {
+	.clk_div_bits = 12,
+	.recheck_sdio_irq = false,
+	.hs400_tune = false,
+	.pad_tune_reg = MSDC_PAD_TUNE0,
+	.async_fifo = true,
+	.data_tune = true,
+	.busy_check = true,
+	.stop_clk_fix = true,
+	.enhance_rx = true,
+	.support_64g = true,
+};
+
+static const struct mtk_mmc_compatible mt6779_compat = {
+	.clk_div_bits = 12,
+	.recheck_sdio_irq = false,
+	.hs400_tune = false,
+	.pad_tune_reg = MSDC_PAD_TUNE0,
+	.async_fifo = true,
+	.data_tune = true,
+	.busy_check = true,
+	.stop_clk_fix = true,
+	.enhance_rx = true,
+	.support_64g = true,
+};
+
+static const struct mtk_mmc_compatible mt6795_compat = {
+	.clk_div_bits = 8,
+	.recheck_sdio_irq = false,
+	.hs400_tune = true,
+	.pad_tune_reg = MSDC_PAD_TUNE,
+	.async_fifo = false,
+	.data_tune = false,
+	.busy_check = false,
+	.stop_clk_fix = false,
+	.enhance_rx = false,
+	.support_64g = false,
+};
+
+static const struct mtk_mmc_compatible mt7620_compat = {
+	.clk_div_bits = 8,
+	.recheck_sdio_irq = true,
+	.hs400_tune = false,
+	.pad_tune_reg = MSDC_PAD_TUNE,
+	.async_fifo = false,
+	.data_tune = false,
+	.busy_check = false,
+	.stop_clk_fix = false,
+	.enhance_rx = false,
+	.use_internal_cd = true,
+};
+
+static const struct mtk_mmc_compatible mt7622_compat = {
+	.clk_div_bits = 12,
+	.recheck_sdio_irq = true,
+	.hs400_tune = false,
+	.pad_tune_reg = MSDC_PAD_TUNE0,
+	.async_fifo = true,
+	.data_tune = true,
+	.busy_check = true,
+	.stop_clk_fix = true,
+	.enhance_rx = true,
+	.support_64g = false,
+};
+
 static const struct mtk_mmc_compatible mt8135_compat = {
 	.clk_div_bits = 8,
 	.recheck_sdio_irq = true,
@@ -513,45 +591,6 @@ static const struct mtk_mmc_compatible mt8183_compat = {
 	.support_64g = true,
 };
 
-static const struct mtk_mmc_compatible mt2701_compat = {
-	.clk_div_bits = 12,
-	.recheck_sdio_irq = true,
-	.hs400_tune = false,
-	.pad_tune_reg = MSDC_PAD_TUNE0,
-	.async_fifo = true,
-	.data_tune = true,
-	.busy_check = false,
-	.stop_clk_fix = false,
-	.enhance_rx = false,
-	.support_64g = false,
-};
-
-static const struct mtk_mmc_compatible mt2712_compat = {
-	.clk_div_bits = 12,
-	.recheck_sdio_irq = false,
-	.hs400_tune = false,
-	.pad_tune_reg = MSDC_PAD_TUNE0,
-	.async_fifo = true,
-	.data_tune = true,
-	.busy_check = true,
-	.stop_clk_fix = true,
-	.enhance_rx = true,
-	.support_64g = true,
-};
-
-static const struct mtk_mmc_compatible mt7622_compat = {
-	.clk_div_bits = 12,
-	.recheck_sdio_irq = true,
-	.hs400_tune = false,
-	.pad_tune_reg = MSDC_PAD_TUNE0,
-	.async_fifo = true,
-	.data_tune = true,
-	.busy_check = true,
-	.stop_clk_fix = true,
-	.enhance_rx = true,
-	.support_64g = false,
-};
-
 static const struct mtk_mmc_compatible mt8516_compat = {
 	.clk_div_bits = 12,
 	.recheck_sdio_irq = true,
@@ -563,42 +602,18 @@ static const struct mtk_mmc_compatible mt8516_compat = {
 	.stop_clk_fix = true,
 };
 
-static const struct mtk_mmc_compatible mt7620_compat = {
-	.clk_div_bits = 8,
-	.recheck_sdio_irq = true,
-	.hs400_tune = false,
-	.pad_tune_reg = MSDC_PAD_TUNE,
-	.async_fifo = false,
-	.data_tune = false,
-	.busy_check = false,
-	.stop_clk_fix = false,
-	.enhance_rx = false,
-	.use_internal_cd = true,
-};
-
-static const struct mtk_mmc_compatible mt6779_compat = {
-	.clk_div_bits = 12,
-	.recheck_sdio_irq = false,
-	.hs400_tune = false,
-	.pad_tune_reg = MSDC_PAD_TUNE0,
-	.async_fifo = true,
-	.data_tune = true,
-	.busy_check = true,
-	.stop_clk_fix = true,
-	.enhance_rx = true,
-	.support_64g = true,
-};
-
 static const struct of_device_id msdc_of_ids[] = {
+	{ .compatible = "mediatek,mt2701-mmc", .data = &mt2701_compat},
+	{ .compatible = "mediatek,mt2712-mmc", .data = &mt2712_compat},
+	{ .compatible = "mediatek,mt6779-mmc", .data = &mt6779_compat},
+	{ .compatible = "mediatek,mt6795-mmc", .data = &mt6795_compat},
+	{ .compatible = "mediatek,mt7620-mmc", .data = &mt7620_compat},
+	{ .compatible = "mediatek,mt7622-mmc", .data = &mt7622_compat},
 	{ .compatible = "mediatek,mt8135-mmc", .data = &mt8135_compat},
 	{ .compatible = "mediatek,mt8173-mmc", .data = &mt8173_compat},
 	{ .compatible = "mediatek,mt8183-mmc", .data = &mt8183_compat},
-	{ .compatible = "mediatek,mt2701-mmc", .data = &mt2701_compat},
-	{ .compatible = "mediatek,mt2712-mmc", .data = &mt2712_compat},
-	{ .compatible = "mediatek,mt7622-mmc", .data = &mt7622_compat},
 	{ .compatible = "mediatek,mt8516-mmc", .data = &mt8516_compat},
-	{ .compatible = "mediatek,mt7620-mmc", .data = &mt7620_compat},
-	{ .compatible = "mediatek,mt6779-mmc", .data = &mt6779_compat},
+
 	{}
 };
 MODULE_DEVICE_TABLE(of, msdc_of_ids);
@@ -640,11 +655,11 @@ static void msdc_reset_hw(struct msdc_host *host)
 	u32 val;
 
 	sdr_set_bits(host->base + MSDC_CFG, MSDC_CFG_RST);
-	readl_poll_timeout(host->base + MSDC_CFG, val, !(val & MSDC_CFG_RST), 0, 0);
+	readl_poll_timeout_atomic(host->base + MSDC_CFG, val, !(val & MSDC_CFG_RST), 0, 0);
 
 	sdr_set_bits(host->base + MSDC_FIFOCS, MSDC_FIFOCS_CLR);
-	readl_poll_timeout(host->base + MSDC_FIFOCS, val,
-			   !(val & MSDC_FIFOCS_CLR), 0, 0);
+	readl_poll_timeout_atomic(host->base + MSDC_FIFOCS, val,
+				  !(val & MSDC_FIFOCS_CLR), 0, 0);
 
 	val = readl(host->base + MSDC_INT);
 	writel(val, host->base + MSDC_INT);
@@ -2446,6 +2461,9 @@ static void msdc_cqe_disable(struct mmc_host *mmc, bool recovery)
 	/* disable busy check */
 	sdr_clr_bits(host->base + MSDC_PATCH_BIT1, MSDC_PB1_BUSY_CHECK_SEL);
 
+	val = readl(host->base + MSDC_INT);
+	writel(val, host->base + MSDC_INT);
+
 	if (recovery) {
 		sdr_set_field(host->base + MSDC_DMA_CTRL,
 			      MSDC_DMA_CTRL_STOP, 1);
@@ -2570,12 +2588,10 @@ static int msdc_of_clock_parse(struct platform_device *pdev,
 			return PTR_ERR(host->src_clk_cg);
 	}
 
-	host->sys_clk_cg = devm_clk_get_optional(&pdev->dev, "sys_cg");
+	/* If present, always enable for this clock gate */
+	host->sys_clk_cg = devm_clk_get_optional_enabled(&pdev->dev, "sys_cg");
 	if (IS_ERR(host->sys_clk_cg))
 		host->sys_clk_cg = NULL;
-
-	/* If present, always enable for this clock gate */
-	clk_prepare_enable(host->sys_clk_cg);
 
 	host->bulk_clks[0].id = "pclk_cg";
 	host->bulk_clks[1].id = "axi_cg";
@@ -2642,7 +2658,7 @@ static int msdc_drv_probe(struct platform_device *pdev)
 
 	host->irq = platform_get_irq(pdev, 0);
 	if (host->irq < 0) {
-		ret = -EINVAL;
+		ret = host->irq;
 		goto host_free;
 	}
 
@@ -2669,7 +2685,7 @@ static int msdc_drv_probe(struct platform_device *pdev)
 
 	/* Support for SDIO eint irq ? */
 	if ((mmc->pm_caps & MMC_PM_WAKE_SDIO_IRQ) && (mmc->pm_caps & MMC_PM_KEEP_POWER)) {
-		host->eint_irq = platform_get_irq_byname(pdev, "sdio_wakeup");
+		host->eint_irq = platform_get_irq_byname_optional(pdev, "sdio_wakeup");
 		if (host->eint_irq > 0) {
 			host->pins_eint = pinctrl_lookup_state(host->pinctrl, "state_eint");
 			if (IS_ERR(host->pins_eint)) {
@@ -2932,11 +2948,14 @@ static int __maybe_unused msdc_suspend(struct device *dev)
 	struct mmc_host *mmc = dev_get_drvdata(dev);
 	struct msdc_host *host = mmc_priv(mmc);
 	int ret;
+	u32 val;
 
 	if (mmc->caps2 & MMC_CAP2_CQE) {
 		ret = cqhci_suspend(mmc);
 		if (ret)
 			return ret;
+		val = readl(host->base + MSDC_INT);
+		writel(val, host->base + MSDC_INT);
 	}
 
 	/*

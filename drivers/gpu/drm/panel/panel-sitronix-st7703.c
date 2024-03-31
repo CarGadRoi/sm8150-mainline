@@ -428,29 +428,30 @@ static int st7703_prepare(struct drm_panel *panel)
 		return 0;
 
 	dev_dbg(ctx->dev, "Resetting the panel\n");
-	ret = regulator_enable(ctx->vcc);
-	if (ret < 0) {
-		dev_err(ctx->dev, "Failed to enable vcc supply: %d\n", ret);
-		return ret;
-	}
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+
 	ret = regulator_enable(ctx->iovcc);
 	if (ret < 0) {
 		dev_err(ctx->dev, "Failed to enable iovcc supply: %d\n", ret);
-		goto disable_vcc;
+		return ret;
 	}
 
-	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-	usleep_range(20, 40);
+	ret = regulator_enable(ctx->vcc);
+	if (ret < 0) {
+		dev_err(ctx->dev, "Failed to enable vcc supply: %d\n", ret);
+		regulator_disable(ctx->iovcc);
+		return ret;
+	}
+
+	/* Give power supplies time to stabilize before deasserting reset. */
+	usleep_range(10000, 20000);
+
 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
-	msleep(20);
+	usleep_range(15000, 20000);
 
 	ctx->prepared = true;
 
 	return 0;
-
-disable_vcc:
-	regulator_disable(ctx->vcc);
-	return ret;
 }
 
 static const u32 mantix_bus_formats[] = {
@@ -598,7 +599,7 @@ static void st7703_shutdown(struct mipi_dsi_device *dsi)
 		dev_err(&dsi->dev, "Failed to disable panel: %d\n", ret);
 }
 
-static int st7703_remove(struct mipi_dsi_device *dsi)
+static void st7703_remove(struct mipi_dsi_device *dsi)
 {
 	struct st7703 *ctx = mipi_dsi_get_drvdata(dsi);
 	int ret;
@@ -612,8 +613,6 @@ static int st7703_remove(struct mipi_dsi_device *dsi)
 	drm_panel_remove(&ctx->panel);
 
 	st7703_debugfs_remove(ctx);
-
-	return 0;
 }
 
 static const struct of_device_id st7703_of_match[] = {

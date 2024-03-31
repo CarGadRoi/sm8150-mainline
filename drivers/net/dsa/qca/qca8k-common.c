@@ -281,7 +281,7 @@ void qca8k_fdb_flush(struct qca8k_priv *priv)
 }
 
 static int qca8k_fdb_search_and_insert(struct qca8k_priv *priv, u8 port_mask,
-				       const u8 *mac, u16 vid)
+				       const u8 *mac, u16 vid, u8 aging)
 {
 	struct qca8k_fdb fdb = { 0 };
 	int ret;
@@ -298,10 +298,12 @@ static int qca8k_fdb_search_and_insert(struct qca8k_priv *priv, u8 port_mask,
 		goto exit;
 
 	/* Rule exist. Delete first */
-	if (!fdb.aging) {
+	if (fdb.aging) {
 		ret = qca8k_fdb_access(priv, QCA8K_FDB_PURGE, -1);
 		if (ret)
 			goto exit;
+	} else {
+		fdb.aging = aging;
 	}
 
 	/* Add port to fdb portmask */
@@ -325,6 +327,10 @@ static int qca8k_fdb_search_and_del(struct qca8k_priv *priv, u8 port_mask,
 
 	qca8k_fdb_write(priv, vid, 0, mac, 0);
 	ret = qca8k_fdb_access(priv, QCA8K_FDB_SEARCH, -1);
+	if (ret < 0)
+		goto exit;
+
+	ret = qca8k_fdb_read(priv, &fdb);
 	if (ret < 0)
 		goto exit;
 
@@ -847,7 +853,11 @@ int qca8k_port_mdb_add(struct dsa_switch *ds, int port,
 	const u8 *addr = mdb->addr;
 	u16 vid = mdb->vid;
 
-	return qca8k_fdb_search_and_insert(priv, BIT(port), addr, vid);
+	if (!vid)
+		vid = QCA8K_PORT_VID_DEF;
+
+	return qca8k_fdb_search_and_insert(priv, BIT(port), addr, vid,
+					   QCA8K_ATU_STATUS_STATIC);
 }
 
 int qca8k_port_mdb_del(struct dsa_switch *ds, int port,
@@ -857,6 +867,9 @@ int qca8k_port_mdb_del(struct dsa_switch *ds, int port,
 	struct qca8k_priv *priv = ds->priv;
 	const u8 *addr = mdb->addr;
 	u16 vid = mdb->vid;
+
+	if (!vid)
+		vid = QCA8K_PORT_VID_DEF;
 
 	return qca8k_fdb_search_and_del(priv, BIT(port), addr, vid);
 }
@@ -1017,7 +1030,8 @@ int qca8k_port_vlan_del(struct dsa_switch *ds, int port,
 
 static bool qca8k_lag_can_offload(struct dsa_switch *ds,
 				  struct dsa_lag lag,
-				  struct netdev_lag_upper_info *info)
+				  struct netdev_lag_upper_info *info,
+				  struct netlink_ext_ack *extack)
 {
 	struct dsa_port *dp;
 	int members = 0;
@@ -1029,15 +1043,24 @@ static bool qca8k_lag_can_offload(struct dsa_switch *ds,
 		/* Includes the port joining the LAG */
 		members++;
 
-	if (members > QCA8K_NUM_PORTS_FOR_LAG)
+	if (members > QCA8K_NUM_PORTS_FOR_LAG) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Cannot offload more than 4 LAG ports");
 		return false;
+	}
 
-	if (info->tx_type != NETDEV_LAG_TX_TYPE_HASH)
+	if (info->tx_type != NETDEV_LAG_TX_TYPE_HASH) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Can only offload LAG using hash TX type");
 		return false;
+	}
 
 	if (info->hash_type != NETDEV_LAG_HASH_L2 &&
-	    info->hash_type != NETDEV_LAG_HASH_L23)
+	    info->hash_type != NETDEV_LAG_HASH_L23) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Can only offload L2 or L2+L3 TX hash");
 		return false;
+	}
 
 	return true;
 }
@@ -1160,11 +1183,12 @@ static int qca8k_lag_refresh_portmap(struct dsa_switch *ds, int port,
 }
 
 int qca8k_port_lag_join(struct dsa_switch *ds, int port, struct dsa_lag lag,
-			struct netdev_lag_upper_info *info)
+			struct netdev_lag_upper_info *info,
+			struct netlink_ext_ack *extack)
 {
 	int ret;
 
-	if (!qca8k_lag_can_offload(ds, lag, info))
+	if (!qca8k_lag_can_offload(ds, lag, info, extack))
 		return -EOPNOTSUPP;
 
 	ret = qca8k_lag_setup_hash(ds, lag, info);

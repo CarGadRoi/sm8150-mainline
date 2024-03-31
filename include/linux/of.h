@@ -342,7 +342,7 @@ extern int of_property_read_string_helper(const struct device_node *np,
 					      const char **out_strs, size_t sz, int index);
 extern int of_device_is_compatible(const struct device_node *device,
 				   const char *);
-extern int of_device_compatible_match(struct device_node *device,
+extern int of_device_compatible_match(const struct device_node *device,
 				      const char *const *compat);
 extern bool of_device_is_available(const struct device_node *device);
 extern bool of_device_is_big_endian(const struct device_node *device);
@@ -562,7 +562,7 @@ static inline int of_device_is_compatible(const struct device_node *device,
 	return 0;
 }
 
-static inline  int of_device_compatible_match(struct device_node *device,
+static inline  int of_device_compatible_match(const struct device_node *device,
 					      const char *const *compat)
 {
 	return 0;
@@ -1155,7 +1155,8 @@ static inline int of_property_read_string_index(const struct device_node *np,
  * @np:		device node from which the property value is to be read.
  * @propname:	name of the property to be searched.
  *
- * Search for a property in a device node.
+ * Search for a boolean property in a device node. Usage on non-boolean
+ * property types is deprecated.
  *
  * Return: true if the property exists false otherwise.
  */
@@ -1165,6 +1166,20 @@ static inline bool of_property_read_bool(const struct device_node *np,
 	struct property *prop = of_find_property(np, propname, NULL);
 
 	return prop ? true : false;
+}
+
+/**
+ * of_property_present - Test if a property is present in a node
+ * @np:		device node to search for the property.
+ * @propname:	name of the property to be searched.
+ *
+ * Test for a property present in a device node.
+ *
+ * Return: true if the property exists false otherwise.
+ */
+static inline bool of_property_present(const struct device_node *np, const char *propname)
+{
+	return of_property_read_bool(np, propname);
 }
 
 /**

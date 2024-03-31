@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /*
  * Copyright 2014-2018 Advanced Micro Devices, Inc.
  *
@@ -40,10 +41,10 @@
 #define AMDGPU_USERPTR_RESTORE_DELAY_MS 1
 
 /*
- * Align VRAM allocations to 2MB to avoid fragmentation caused by 4K allocations in the tail 2MB
+ * Align VRAM availability to 2MB to avoid fragmentation caused by 4K allocations in the tail 2MB
  * BO chunk
  */
-#define VRAM_ALLOCATION_ALIGN (1 << 21)
+#define VRAM_AVAILABLITY_ALIGN (1 << 21)
 
 /* Impose limit on how much memory KFD can use */
 static struct {
@@ -149,7 +150,7 @@ int amdgpu_amdkfd_reserve_mem_limit(struct amdgpu_device *adev,
 		 * to avoid fragmentation caused by 4K allocations in the tail
 		 * 2M BO chunk.
 		 */
-		vram_needed = ALIGN(size, VRAM_ALLOCATION_ALIGN);
+		vram_needed = size;
 	} else if (alloc_flag & KFD_IOC_ALLOC_MEM_FLAGS_USERPTR) {
 		system_mem_needed = size;
 	} else if (!(alloc_flag &
@@ -170,9 +171,7 @@ int amdgpu_amdkfd_reserve_mem_limit(struct amdgpu_device *adev,
 	    (kfd_mem_limit.ttm_mem_used + ttm_mem_needed >
 	     kfd_mem_limit.max_ttm_mem_limit) ||
 	    (adev && adev->kfd.vram_used + vram_needed >
-	     adev->gmc.real_vram_size -
-	     atomic64_read(&adev->vram_pin_size) -
-	     reserved_for_pt)) {
+	     adev->gmc.real_vram_size - reserved_for_pt)) {
 		ret = -ENOMEM;
 		goto release;
 	}
@@ -182,8 +181,10 @@ int amdgpu_amdkfd_reserve_mem_limit(struct amdgpu_device *adev,
 	 */
 	WARN_ONCE(vram_needed && !adev,
 		  "adev reference can't be null when vram is used");
-	if (adev)
+	if (adev) {
 		adev->kfd.vram_used += vram_needed;
+		adev->kfd.vram_used_aligned += ALIGN(vram_needed, VRAM_AVAILABLITY_ALIGN);
+	}
 	kfd_mem_limit.system_mem_used += system_mem_needed;
 	kfd_mem_limit.ttm_mem_used += ttm_mem_needed;
 
@@ -203,8 +204,10 @@ void amdgpu_amdkfd_unreserve_mem_limit(struct amdgpu_device *adev,
 	} else if (alloc_flag & KFD_IOC_ALLOC_MEM_FLAGS_VRAM) {
 		WARN_ONCE(!adev,
 			  "adev reference can't be null when alloc mem flags vram is set");
-		if (adev)
-			adev->kfd.vram_used -= ALIGN(size, VRAM_ALLOCATION_ALIGN);
+		if (adev) {
+			adev->kfd.vram_used -= size;
+			adev->kfd.vram_used_aligned -= ALIGN(size, VRAM_AVAILABLITY_ALIGN);
+		}
 	} else if (alloc_flag & KFD_IOC_ALLOC_MEM_FLAGS_USERPTR) {
 		kfd_mem_limit.system_mem_used -= size;
 	} else if (!(alloc_flag &
@@ -293,7 +296,7 @@ static int amdgpu_amdkfd_remove_eviction_fence(struct amdgpu_bo *bo,
 	 */
 	replacement = dma_fence_get_stub();
 	dma_resv_replace_fences(bo->tbo.base.resv, ef->base.context,
-				replacement, DMA_RESV_USAGE_READ);
+				replacement, DMA_RESV_USAGE_BOOKKEEP);
 	dma_fence_put(replacement);
 	return 0;
 }
@@ -505,12 +508,12 @@ kfd_mem_dmamap_userptr(struct kgd_mem *mem,
 	struct ttm_tt *ttm = bo->tbo.ttm;
 	int ret;
 
+	if (WARN_ON(ttm->num_pages != src_ttm->num_pages))
+		return -EINVAL;
+
 	ttm->sg = kmalloc(sizeof(*ttm->sg), GFP_KERNEL);
 	if (unlikely(!ttm->sg))
 		return -ENOMEM;
-
-	if (WARN_ON(ttm->num_pages != src_ttm->num_pages))
-		return -EINVAL;
 
 	/* Same sequence as in amdgpu_ttm_tt_pin_userptr */
 	ret = sg_alloc_table_from_pages(ttm->sg, src_ttm->pages,
@@ -983,6 +986,7 @@ static int init_user_pages(struct kgd_mem *mem, uint64_t user_addr,
 	struct amdkfd_process_info *process_info = mem->process_info;
 	struct amdgpu_bo *bo = mem->bo;
 	struct ttm_operation_ctx ctx = { true, false };
+	struct hmm_range *range;
 	int ret = 0;
 
 	mutex_lock(&process_info->lock);
@@ -1012,7 +1016,7 @@ static int init_user_pages(struct kgd_mem *mem, uint64_t user_addr,
 		return 0;
 	}
 
-	ret = amdgpu_ttm_tt_get_user_pages(bo, bo->tbo.ttm->pages);
+	ret = amdgpu_ttm_tt_get_user_pages(bo, bo->tbo.ttm->pages, &range);
 	if (ret) {
 		pr_err("%s: Failed to get user pages: %d\n", __func__, ret);
 		goto unregister_out;
@@ -1030,7 +1034,7 @@ static int init_user_pages(struct kgd_mem *mem, uint64_t user_addr,
 	amdgpu_bo_unreserve(bo);
 
 release_out:
-	amdgpu_ttm_tt_get_user_pages_done(bo->tbo.ttm);
+	amdgpu_ttm_tt_get_user_pages_done(bo->tbo.ttm, range);
 unregister_out:
 	if (ret)
 		amdgpu_mn_unregister(bo);
@@ -1386,8 +1390,9 @@ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
 	ret = dma_resv_reserve_fences(vm->root.bo->tbo.base.resv, 1);
 	if (ret)
 		goto reserve_shared_fail;
-	amdgpu_bo_fence(vm->root.bo,
-			&vm->process_info->eviction_fence->base, true);
+	dma_resv_add_fence(vm->root.bo->tbo.base.resv,
+			   &vm->process_info->eviction_fence->base,
+			   DMA_RESV_USAGE_BOOKKEEP);
 	amdgpu_bo_unreserve(vm->root.bo);
 
 	/* Update process info */
@@ -1468,8 +1473,36 @@ static void amdgpu_amdkfd_gpuvm_unpin_bo(struct amdgpu_bo *bo)
 	amdgpu_bo_unreserve(bo);
 }
 
+int amdgpu_amdkfd_gpuvm_set_vm_pasid(struct amdgpu_device *adev,
+				     struct file *filp, u32 pasid)
+
+{
+	struct amdgpu_fpriv *drv_priv;
+	struct amdgpu_vm *avm;
+	int ret;
+
+	ret = amdgpu_file_to_fpriv(filp, &drv_priv);
+	if (ret)
+		return ret;
+	avm = &drv_priv->vm;
+
+	/* Free the original amdgpu allocated pasid,
+	 * will be replaced with kfd allocated pasid.
+	 */
+	if (avm->pasid) {
+		amdgpu_pasid_free(avm->pasid);
+		amdgpu_vm_set_pasid(adev, avm, 0);
+	}
+
+	ret = amdgpu_vm_set_pasid(adev, avm, pasid);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
 int amdgpu_amdkfd_gpuvm_acquire_process_vm(struct amdgpu_device *adev,
-					   struct file *filp, u32 pasid,
+					   struct file *filp,
 					   void **process_info,
 					   struct dma_fence **ef)
 {
@@ -1486,22 +1519,11 @@ int amdgpu_amdkfd_gpuvm_acquire_process_vm(struct amdgpu_device *adev,
 	if (avm->process_info)
 		return -EINVAL;
 
-	/* Free the original amdgpu allocated pasid,
-	 * will be replaced with kfd allocated pasid.
-	 */
-	if (avm->pasid) {
-		amdgpu_pasid_free(avm->pasid);
-		amdgpu_vm_set_pasid(adev, avm, 0);
-	}
-
 	/* Convert VM into a compute VM */
 	ret = amdgpu_vm_make_compute(adev, avm);
 	if (ret)
 		return ret;
 
-	ret = amdgpu_vm_set_pasid(adev, avm, pasid);
-	if (ret)
-		return ret;
 	/* Initialize KFD part of the VM and process info */
 	ret = init_kfd_vm(avm, process_info, ef);
 	if (ret)
@@ -1611,12 +1633,12 @@ size_t amdgpu_amdkfd_get_available_memory(struct amdgpu_device *adev)
 
 	spin_lock(&kfd_mem_limit.mem_limit_lock);
 	available = adev->gmc.real_vram_size
-		- adev->kfd.vram_used
+		- adev->kfd.vram_used_aligned
 		- atomic64_read(&adev->vram_pin_size)
 		- reserved_for_pt;
 	spin_unlock(&kfd_mem_limit.mem_limit_lock);
 
-	return ALIGN_DOWN(available, VRAM_ALLOCATION_ALIGN);
+	return ALIGN_DOWN(available, VRAM_AVAILABLITY_ALIGN);
 }
 
 int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
@@ -1631,6 +1653,7 @@ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
 	struct amdgpu_bo *bo;
 	struct drm_gem_object *gobj = NULL;
 	u32 domain, alloc_domain;
+	uint64_t aligned_size;
 	u64 alloc_flags;
 	int ret;
 
@@ -1681,22 +1704,23 @@ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
 	 * the memory.
 	 */
 	if ((*mem)->aql_queue)
-		size = size >> 1;
+		size >>= 1;
+	aligned_size = PAGE_ALIGN(size);
 
 	(*mem)->alloc_flags = flags;
 
 	amdgpu_sync_create(&(*mem)->sync);
 
-	ret = amdgpu_amdkfd_reserve_mem_limit(adev, size, flags);
+	ret = amdgpu_amdkfd_reserve_mem_limit(adev, aligned_size, flags);
 	if (ret) {
 		pr_debug("Insufficient memory\n");
 		goto err_reserve_limit;
 	}
 
 	pr_debug("\tcreate BO VA 0x%llx size 0x%llx domain %s\n",
-			va, size, domain_string(alloc_domain));
+			va, (*mem)->aql_queue ? size << 1 : size, domain_string(alloc_domain));
 
-	ret = amdgpu_gem_object_create(adev, size, 1, alloc_domain, alloc_flags,
+	ret = amdgpu_gem_object_create(adev, aligned_size, 1, alloc_domain, alloc_flags,
 				       bo_type, NULL, &gobj);
 	if (ret) {
 		pr_debug("Failed to create BO on domain %s. ret %d\n",
@@ -1725,7 +1749,7 @@ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
 	add_kgd_mem_to_kfd_bo_list(*mem, avm->process_info, user_addr);
 
 	if (user_addr) {
-		pr_debug("creating userptr BO for user_addr = %llu\n", user_addr);
+		pr_debug("creating userptr BO for user_addr = %llx\n", user_addr);
 		ret = init_user_pages(*mem, user_addr, criu_resume);
 		if (ret)
 			goto allocate_init_user_pages_failed;
@@ -1753,7 +1777,7 @@ err_node_allow:
 	/* Don't unreserve system mem limit twice */
 	goto err_reserve_limit;
 err_bo_create:
-	amdgpu_amdkfd_unreserve_mem_limit(adev, size, flags);
+	amdgpu_amdkfd_unreserve_mem_limit(adev, aligned_size, flags);
 err_reserve_limit:
 	mutex_destroy(&(*mem)->lock);
 	if (gobj)
@@ -1984,9 +2008,9 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
 	}
 
 	if (!amdgpu_ttm_tt_get_usermm(bo->tbo.ttm) && !bo->tbo.pin_count)
-		amdgpu_bo_fence(bo,
-				&avm->process_info->eviction_fence->base,
-				true);
+		dma_resv_add_fence(bo->tbo.base.resv,
+				   &avm->process_info->eviction_fence->base,
+				   DMA_RESV_USAGE_BOOKKEEP);
 	ret = unreserve_bo_and_vms(&ctx, false, false);
 
 	goto out;
@@ -2108,7 +2132,7 @@ int amdgpu_amdkfd_map_gtt_bo_to_gart(struct amdgpu_device *adev, struct amdgpu_b
 	}
 
 	amdgpu_amdkfd_remove_eviction_fence(
-		bo, bo->kfd_bo->process_info->eviction_fence);
+		bo, bo->vm_bo->vm->process_info->eviction_fence);
 
 	amdgpu_bo_unreserve(bo);
 
@@ -2213,7 +2237,7 @@ int amdgpu_amdkfd_gpuvm_get_vm_fault_info(struct amdgpu_device *adev,
 {
 	if (atomic_read(&adev->gmc.vm_fault_info_updated) == 1) {
 		*mem = *adev->gmc.vm_fault_info;
-		mb();
+		mb(); /* make sure read happened */
 		atomic_set(&adev->gmc.vm_fault_info_updated, 0);
 	}
 	return 0;
@@ -2251,7 +2275,7 @@ int amdgpu_amdkfd_gpuvm_import_dmabuf(struct amdgpu_device *adev,
 
 	ret = drm_vma_node_allow(&obj->vma_node, drm_priv);
 	if (ret) {
-		kfree(mem);
+		kfree(*mem);
 		return ret;
 	}
 
@@ -2366,6 +2390,8 @@ static int update_invalid_user_pages(struct amdkfd_process_info *process_info,
 	/* Go through userptr_inval_list and update any invalid user_pages */
 	list_for_each_entry(mem, &process_info->userptr_inval_list,
 			    validate_list.head) {
+		struct hmm_range *range;
+
 		invalid = atomic_read(&mem->invalid);
 		if (!invalid)
 			/* BO hasn't been invalidated since the last
@@ -2376,7 +2402,8 @@ static int update_invalid_user_pages(struct amdkfd_process_info *process_info,
 		bo = mem->bo;
 
 		/* Get updated user pages */
-		ret = amdgpu_ttm_tt_get_user_pages(bo, bo->tbo.ttm->pages);
+		ret = amdgpu_ttm_tt_get_user_pages(bo, bo->tbo.ttm->pages,
+						   &range);
 		if (ret) {
 			pr_debug("Failed %d to get user pages\n", ret);
 
@@ -2395,7 +2422,7 @@ static int update_invalid_user_pages(struct amdkfd_process_info *process_info,
 			 * FIXME: Cannot ignore the return code, must hold
 			 * notifier_lock
 			 */
-			amdgpu_ttm_tt_get_user_pages_done(bo->tbo.ttm);
+			amdgpu_ttm_tt_get_user_pages_done(bo->tbo.ttm, range);
 		}
 
 		/* Mark the BO as valid unless it was invalidated
@@ -2710,6 +2737,9 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info, struct dma_fence **ef)
 			if (!attachment->is_mapped)
 				continue;
 
+			if (attachment->bo_va->base.bo->tbo.pin_count)
+				continue;
+
 			kfd_mem_dmaunmap_attachment(mem, attachment);
 			ret = update_gpuvm_pte(mem, attachment, &sync_obj);
 			if (ret) {
@@ -2755,15 +2785,18 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info, struct dma_fence **ef)
 		if (mem->bo->tbo.pin_count)
 			continue;
 
-		amdgpu_bo_fence(mem->bo,
-			&process_info->eviction_fence->base, true);
+		dma_resv_add_fence(mem->bo->tbo.base.resv,
+				   &process_info->eviction_fence->base,
+				   DMA_RESV_USAGE_BOOKKEEP);
 	}
 	/* Attach eviction fence to PD / PT BOs */
 	list_for_each_entry(peer_vm, &process_info->vm_list_head,
 			    vm_list_node) {
 		struct amdgpu_bo *bo = peer_vm->root.bo;
 
-		amdgpu_bo_fence(bo, &process_info->eviction_fence->base, true);
+		dma_resv_add_fence(bo->tbo.base.resv,
+				   &process_info->eviction_fence->base,
+				   DMA_RESV_USAGE_BOOKKEEP);
 	}
 
 validate_map_fail:
@@ -2817,7 +2850,9 @@ int amdgpu_amdkfd_add_gws_to_process(void *info, void *gws, struct kgd_mem **mem
 	ret = dma_resv_reserve_fences(gws_bo->tbo.base.resv, 1);
 	if (ret)
 		goto reserve_shared_fail;
-	amdgpu_bo_fence(gws_bo, &process_info->eviction_fence->base, true);
+	dma_resv_add_fence(gws_bo->tbo.base.resv,
+			   &process_info->eviction_fence->base,
+			   DMA_RESV_USAGE_BOOKKEEP);
 	amdgpu_bo_unreserve(gws_bo);
 	mutex_unlock(&(*mem)->process_info->lock);
 

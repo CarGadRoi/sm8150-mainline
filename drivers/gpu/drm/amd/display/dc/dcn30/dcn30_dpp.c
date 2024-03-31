@@ -244,8 +244,6 @@ void dpp3_cnv_setup (
 		select = INPUT_CSC_SELECT_ICSC;
 		break;
 	case SURFACE_PIXEL_FORMAT_GRPH_ARGB16161616:
-		pixel_format = 22;
-		break;
 	case SURFACE_PIXEL_FORMAT_GRPH_ABGR16161616:
 		pixel_format = 26; /* ARGB16161616_UNORM */
 		break;
@@ -359,8 +357,11 @@ void dpp3_set_cursor_attributes(
 	int cur_rom_en = 0;
 
 	if (color_format == CURSOR_MODE_COLOR_PRE_MULTIPLIED_ALPHA ||
-		color_format == CURSOR_MODE_COLOR_UN_PRE_MULTIPLIED_ALPHA)
-		cur_rom_en = 1;
+		color_format == CURSOR_MODE_COLOR_UN_PRE_MULTIPLIED_ALPHA) {
+		if (cursor_attributes->attribute_flags.bits.ENABLE_CURSOR_DEGAMMA) {
+			cur_rom_en = 1;
+		}
+	}
 
 	REG_UPDATE_3(CURSOR0_CONTROL,
 			CUR0_MODE, color_format,
@@ -374,6 +375,10 @@ void dpp3_set_cursor_attributes(
 		REG_UPDATE(CURSOR0_COLOR1,
 				CUR0_COLOR1, 0xFFFFFFFF);
 	}
+
+	dpp_base->att.cur0_ctl.bits.expansion_mode = 0;
+	dpp_base->att.cur0_ctl.bits.cur0_rom_en = cur_rom_en;
+	dpp_base->att.cur0_ctl.bits.mode = color_format;
 }
 
 

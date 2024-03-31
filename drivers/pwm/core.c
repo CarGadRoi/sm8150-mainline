@@ -171,7 +171,7 @@ of_pwm_single_xlate(struct pwm_chip *pc, const struct of_phandle_args *args)
 	pwm->args.period = args->args[0];
 	pwm->args.polarity = PWM_POLARITY_NORMAL;
 
-	if (args->args_count == 2 && args->args[2] & PWM_POLARITY_INVERTED)
+	if (args->args_count == 2 && args->args[1] & PWM_POLARITY_INVERTED)
 		pwm->args.polarity = PWM_POLARITY_INVERSED;
 
 	return pwm;
@@ -678,7 +678,7 @@ static struct pwm_chip *fwnode_to_pwmchip(struct fwnode_handle *fwnode)
 	mutex_lock(&pwm_lock);
 
 	list_for_each_entry(chip, &pwm_chips, list)
-		if (chip->dev && dev_fwnode(chip->dev) == fwnode) {
+		if (chip->dev && device_match_fwnode(chip->dev, fwnode)) {
 			mutex_unlock(&pwm_lock);
 			return chip;
 		}
@@ -734,8 +734,8 @@ static struct device_link *pwm_device_link_add(struct device *dev,
  * Returns: A pointer to the requested PWM device or an ERR_PTR()-encoded
  * error code on failure.
  */
-struct pwm_device *of_pwm_get(struct device *dev, struct device_node *np,
-			      const char *con_id)
+static struct pwm_device *of_pwm_get(struct device *dev, struct device_node *np,
+				     const char *con_id)
 {
 	struct pwm_device *pwm = NULL;
 	struct of_phandle_args args;
@@ -797,7 +797,6 @@ put:
 
 	return pwm;
 }
-EXPORT_SYMBOL_GPL(of_pwm_get);
 
 /**
  * acpi_pwm_get() - request a PWM via parsing "pwms" property in ACPI
@@ -1069,36 +1068,6 @@ struct pwm_device *devm_pwm_get(struct device *dev, const char *con_id)
 	return pwm;
 }
 EXPORT_SYMBOL_GPL(devm_pwm_get);
-
-/**
- * devm_of_pwm_get() - resource managed of_pwm_get()
- * @dev: device for PWM consumer
- * @np: device node to get the PWM from
- * @con_id: consumer name
- *
- * This function performs like of_pwm_get() but the acquired PWM device will
- * automatically be released on driver detach.
- *
- * Returns: A pointer to the requested PWM device or an ERR_PTR()-encoded
- * error code on failure.
- */
-struct pwm_device *devm_of_pwm_get(struct device *dev, struct device_node *np,
-				   const char *con_id)
-{
-	struct pwm_device *pwm;
-	int ret;
-
-	pwm = of_pwm_get(dev, np, con_id);
-	if (IS_ERR(pwm))
-		return pwm;
-
-	ret = devm_add_action_or_reset(dev, devm_pwm_release, pwm);
-	if (ret)
-		return ERR_PTR(ret);
-
-	return pwm;
-}
-EXPORT_SYMBOL_GPL(devm_of_pwm_get);
 
 /**
  * devm_fwnode_pwm_get() - request a resource managed PWM from firmware node

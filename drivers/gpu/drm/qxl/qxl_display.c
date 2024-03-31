@@ -902,7 +902,7 @@ static const struct drm_plane_helper_funcs qxl_cursor_helper_funcs = {
 static const struct drm_plane_funcs qxl_cursor_plane_funcs = {
 	.update_plane	= drm_atomic_helper_update_plane,
 	.disable_plane	= drm_atomic_helper_disable_plane,
-	.destroy	= drm_primary_helper_destroy,
+	.destroy	= drm_plane_helper_destroy,
 	.reset		= drm_atomic_helper_plane_reset,
 	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
@@ -924,7 +924,7 @@ static const struct drm_plane_helper_funcs primary_helper_funcs = {
 static const struct drm_plane_funcs qxl_primary_plane_funcs = {
 	.update_plane	= drm_atomic_helper_update_plane,
 	.disable_plane	= drm_atomic_helper_disable_plane,
-	.destroy	= drm_primary_helper_destroy,
+	.destroy	= drm_plane_helper_destroy,
 	.reset		= drm_atomic_helper_plane_reset,
 	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
@@ -1228,6 +1228,9 @@ int qxl_destroy_monitors_object(struct qxl_device *qdev)
 
 	if (!qdev->monitors_config_bo)
 		return 0;
+
+	kfree(qdev->dumb_heads);
+	qdev->dumb_heads = NULL;
 
 	qdev->monitors_config = NULL;
 	qdev->ram_header->monitors_config = 0;

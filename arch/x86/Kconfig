@@ -69,6 +69,7 @@ config X86
 	select ARCH_ENABLE_THP_MIGRATION if X86_64 && TRANSPARENT_HUGEPAGE
 	select ARCH_HAS_ACPI_TABLE_UPGRADE	if ACPI
 	select ARCH_HAS_CACHE_LINE_SIZE
+	select ARCH_HAS_CPU_FINALIZE_INIT
 	select ARCH_HAS_CURRENT_STACK_POINTER
 	select ARCH_HAS_DEBUG_VIRTUAL
 	select ARCH_HAS_DEBUG_VM_PGTABLE	if !X86_PAE
@@ -85,6 +86,7 @@ config X86
 	select ARCH_HAS_PMEM_API		if X86_64
 	select ARCH_HAS_PTE_DEVMAP		if X86_64
 	select ARCH_HAS_PTE_SPECIAL
+	select ARCH_HAS_NONLEAF_PMD_YOUNG	if PGTABLE_LEVELS > 2
 	select ARCH_HAS_UACCESS_FLUSHCACHE	if X86_64
 	select ARCH_HAS_COPY_MC			if X86_64
 	select ARCH_HAS_SET_MEMORY
@@ -107,6 +109,8 @@ config X86
 	select ARCH_SUPPORTS_PAGE_TABLE_CHECK	if X86_64
 	select ARCH_SUPPORTS_NUMA_BALANCING	if X86_64
 	select ARCH_SUPPORTS_KMAP_LOCAL_FORCE_MAP	if NR_CPUS <= 4096
+	select ARCH_SUPPORTS_CFI_CLANG		if X86_64
+	select ARCH_USES_CFI_TRAPS		if X86_64 && CFI_CLANG
 	select ARCH_SUPPORTS_LTO_CLANG
 	select ARCH_SUPPORTS_LTO_CLANG_THIN
 	select ARCH_USE_BUILTIN_BSWAP
@@ -128,7 +132,9 @@ config X86
 	select CLKEVT_I8253
 	select CLOCKSOURCE_VALIDATE_LAST_CYCLE
 	select CLOCKSOURCE_WATCHDOG
-	select DCACHE_WORD_ACCESS
+	# Word-size accesses may read uninitialized data past the trailing \0
+	# in strings and cause false KMSAN reports.
+	select DCACHE_WORD_ACCESS		if !KMSAN
 	select DYNAMIC_SIGFRAME
 	select EDAC_ATOMIC_SCRUB
 	select EDAC_SUPPORT
@@ -166,6 +172,7 @@ config X86
 	select HAVE_ARCH_KASAN			if X86_64
 	select HAVE_ARCH_KASAN_VMALLOC		if X86_64
 	select HAVE_ARCH_KFENCE
+	select HAVE_ARCH_KMSAN			if X86_64
 	select HAVE_ARCH_KGDB
 	select HAVE_ARCH_MMAP_RND_BITS		if MMU
 	select HAVE_ARCH_MMAP_RND_COMPAT_BITS	if MMU && COMPAT
@@ -257,6 +264,7 @@ config X86
 	select HAVE_STATIC_CALL_INLINE		if HAVE_OBJTOOL
 	select HAVE_PREEMPT_DYNAMIC_CALL
 	select HAVE_RSEQ
+	select HAVE_RUST			if X86_64
 	select HAVE_SYSCALL_TRACEPOINTS
 	select HAVE_UACCESS_VALIDATION		if HAVE_OBJTOOL
 	select HAVE_UNSTABLE_SCHED_CLOCK
@@ -264,6 +272,7 @@ config X86
 	select HAVE_GENERIC_VDSO
 	select HOTPLUG_SMT			if SMP
 	select IRQ_FORCED_THREADING
+	select LOCK_MM_AND_FIND_VMA
 	select NEED_PER_CPU_EMBED_FIRST_CHUNK
 	select NEED_PER_CPU_PAGE_FIRST_CHUNK
 	select NEED_SG_DMA_LENGTH
@@ -284,6 +293,7 @@ config X86
 	select PROC_PID_ARCH_STATUS		if PROC_FS
 	select HAVE_ARCH_NODE_DEV_GROUP		if X86_SGX
 	imply IMA_SECURE_AND_OR_TRUSTED_BOOT    if EFI
+	select HAVE_DYNAMIC_FTRACE_NO_PATCHABLE
 
 config INSTRUCTION_DECODER
 	def_bool y
@@ -323,6 +333,10 @@ config SBUS
 config GENERIC_ISA_DMA
 	def_bool y
 	depends on ISA_DMA_API
+
+config GENERIC_CSUM
+	bool
+	default y if KMSAN || KASAN
 
 config GENERIC_BUG
 	def_bool y
@@ -447,6 +461,11 @@ config X86_X2APIC
 
 	  This allows 32-bit apic IDs (so it can support very large systems),
 	  and accesses the local apic via MSRs not via mmio.
+
+	  Some Intel systems circa 2022 and later are locked into x2APIC mode
+	  and can not fall back to the legacy APIC modes if SGX or TDX are
+	  enabled in the BIOS. They will boot with very reduced functionality
+	  without enabling this option.
 
 	  If you don't know what to do here, say N.
 
@@ -1919,7 +1938,7 @@ endchoice
 
 config X86_SGX
 	bool "Software Guard eXtensions (SGX)"
-	depends on X86_64 && CPU_SUP_INTEL
+	depends on X86_64 && CPU_SUP_INTEL && X86_X2APIC
 	depends on CRYPTO=y
 	depends on CRYPTO_SHA256=y
 	select SRCU
@@ -1956,13 +1975,29 @@ config EFI
 config EFI_STUB
 	bool "EFI stub support"
 	depends on EFI
-	depends on $(cc-option,-mabi=ms) || X86_32
 	select RELOCATABLE
 	help
 	  This kernel feature allows a bzImage to be loaded directly
 	  by EFI firmware without the use of a bootloader.
 
 	  See Documentation/admin-guide/efi-stub.rst for more information.
+
+config EFI_HANDOVER_PROTOCOL
+	bool "EFI handover protocol (DEPRECATED)"
+	depends on EFI_STUB
+	default y
+	help
+	  Select this in order to include support for the deprecated EFI
+	  handover protocol, which defines alternative entry points into the
+	  EFI stub.  This is a practice that has no basis in the UEFI
+	  specification, and requires a priori knowledge on the part of the
+	  bootloader about Linux/x86 specific ways of passing the command line
+	  and initrd, and where in memory those assets may be loaded.
+
+	  If in doubt, say Y. Even though the corresponding support is not
+	  present in upstream GRUB or other bootloaders, most distros build
+	  GRUB with numerous downstream patches applied, and may rely on the
+	  handover protocol as as result.
 
 config EFI_MIXED
 	bool "EFI mixed-mode support"
@@ -2494,6 +2529,13 @@ config CPU_IBRS_ENTRY
 	  This mitigates both spectre_v2 and retbleed at great cost to
 	  performance.
 
+config CPU_SRSO
+	bool "Mitigate speculative RAS overflow on AMD"
+	depends on CPU_SUP_AMD && X86_64 && RETHUNK
+	default y
+	help
+	  Enable the SRSO mitigation needed on AMD Zen1-4 machines.
+
 config SLS
 	bool "Mitigate Straight-Line-Speculation"
 	depends on CC_HAS_SLS && X86_64
@@ -2503,6 +2545,36 @@ config SLS
 	  Compile the kernel with straight-line-speculation options to guard
 	  against straight line speculation. The kernel image might be slightly
 	  larger.
+
+config GDS_FORCE_MITIGATION
+	bool "Force GDS Mitigation"
+	depends on CPU_SUP_INTEL
+	default n
+	help
+	  Gather Data Sampling (GDS) is a hardware vulnerability which allows
+	  unprivileged speculative access to data which was previously stored in
+	  vector registers.
+
+	  This option is equivalent to setting gather_data_sampling=force on the
+	  command line. The microcode mitigation is used if present, otherwise
+	  AVX is disabled as a mitigation. On affected systems that are missing
+	  the microcode any userspace code that unconditionally uses AVX will
+	  break with this option set.
+
+	  Setting this option on systems not vulnerable to GDS has no effect.
+
+	  If in doubt, say N.
+
+config MITIGATION_RFDS
+	bool "RFDS Mitigation"
+	depends on CPU_SUP_INTEL
+	default y
+	help
+	  Enable mitigation for Register File Data Sampling (RFDS) by default.
+	  RFDS is a hardware vulnerability which affects Intel Atom CPUs. It
+	  allows unprivileged speculative access to stale data previously
+	  stored in floating point, vector and integer registers.
+	  See also <file:Documentation/admin-guide/hw-vuln/reg-file-data-sampling.rst>
 
 endif
 
@@ -2569,7 +2641,7 @@ menuconfig APM
 
 	  1) make sure that you have enough swap space and that it is
 	  enabled.
-	  2) pass the "no-hlt" option to the kernel
+	  2) pass the "idle=poll" option to the kernel
 	  3) switch on floating point emulation in the kernel and pass
 	  the "no387" option to the kernel
 	  4) pass the "floppy=nodma" option to the kernel

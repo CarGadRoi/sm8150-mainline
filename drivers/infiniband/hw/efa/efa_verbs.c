@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
 /*
- * Copyright 2018-2021 Amazon.com, Inc. or its affiliates. All rights reserved.
+ * Copyright 2018-2022 Amazon.com, Inc. or its affiliates. All rights reserved.
  */
 
 #include <linux/dma-buf.h>
@@ -15,6 +15,7 @@
 #include <rdma/uverbs_ioctl.h>
 
 #include "efa.h"
+#include "efa_io_defs.h"
 
 enum {
 	EFA_MMAP_DMA_PAGE = 0,
@@ -242,6 +243,7 @@ int efa_query_device(struct ib_device *ibdev,
 		resp.max_rq_wr = dev_attr->max_rq_depth;
 		resp.max_rdma_size = dev_attr->max_rdma_size;
 
+		resp.device_caps |= EFA_QUERY_DEVICE_CAPS_CQ_WITH_SGID;
 		if (EFA_DEV_CAP(dev, RDMA_READ))
 			resp.device_caps |= EFA_QUERY_DEVICE_CAPS_RDMA_READ;
 
@@ -441,11 +443,11 @@ int efa_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 
 	ibdev_dbg(&dev->ibdev, "Destroy qp[%u]\n", ibqp->qp_num);
 
-	efa_qp_user_mmap_entries_remove(qp);
-
 	err = efa_destroy_qp_handle(dev, qp->qp_handle);
 	if (err)
 		return err;
+
+	efa_qp_user_mmap_entries_remove(qp);
 
 	if (qp->rq_cpu_addr) {
 		ibdev_dbg(&dev->ibdev,
@@ -1005,8 +1007,8 @@ int efa_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 		  "Destroy cq[%d] virt[0x%p] freed: size[%lu], dma[%pad]\n",
 		  cq->cq_idx, cq->cpu_addr, cq->size, &cq->dma_addr);
 
-	efa_cq_user_mmap_entries_remove(cq);
 	efa_destroy_cq_idx(dev, cq->cq_idx);
+	efa_cq_user_mmap_entries_remove(cq);
 	if (cq->eq) {
 		xa_erase(&dev->cqs_xa, cq->cq_idx);
 		synchronize_irq(cq->eq->irq.irqn);
@@ -1064,6 +1066,7 @@ int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 	struct efa_ibv_create_cq cmd = {};
 	struct efa_cq *cq = to_ecq(ibcq);
 	int entries = attr->cqe;
+	bool set_src_addr;
 	int err;
 
 	ibdev_dbg(ibdev, "create_cq entries %d\n", entries);
@@ -1109,7 +1112,10 @@ int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 		goto err_out;
 	}
 
-	if (!cmd.cq_entry_size) {
+	set_src_addr = !!(cmd.flags & EFA_CREATE_CQ_WITH_SGID);
+	if ((cmd.cq_entry_size != sizeof(struct efa_io_rx_cdesc_ex)) &&
+	    (set_src_addr ||
+	     cmd.cq_entry_size != sizeof(struct efa_io_rx_cdesc))) {
 		ibdev_dbg(ibdev,
 			  "Invalid entry size [%u]\n", cmd.cq_entry_size);
 		err = -EINVAL;
@@ -1138,6 +1144,7 @@ int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 	params.dma_addr = cq->dma_addr;
 	params.entry_size_in_bytes = cmd.cq_entry_size;
 	params.num_sub_cqs = cmd.num_sub_cqs;
+	params.set_src_addr = set_src_addr;
 	if (cmd.flags & EFA_CREATE_CQ_WITH_COMPLETION_CHANNEL) {
 		cq->eq = efa_vec2eq(dev, attr->comp_vector);
 		params.eqn = cq->eq->eeq.eqn;
@@ -1390,7 +1397,7 @@ static int pbl_continuous_initialize(struct efa_dev *dev,
  */
 static int pbl_indirect_initialize(struct efa_dev *dev, struct pbl_context *pbl)
 {
-	u32 size_in_pages = DIV_ROUND_UP(pbl->pbl_buf_size_in_bytes, PAGE_SIZE);
+	u32 size_in_pages = DIV_ROUND_UP(pbl->pbl_buf_size_in_bytes, EFA_CHUNK_PAYLOAD_SIZE);
 	struct scatterlist *sgl;
 	int sg_dma_cnt, err;
 

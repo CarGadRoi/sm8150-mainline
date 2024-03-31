@@ -355,16 +355,15 @@ static u32 xsk_tx_peek_release_fallback(struct xsk_buff_pool *pool, u32 max_entr
 	return nb_pkts;
 }
 
-u32 xsk_tx_peek_release_desc_batch(struct xsk_buff_pool *pool, u32 max_entries)
+u32 xsk_tx_peek_release_desc_batch(struct xsk_buff_pool *pool, u32 nb_pkts)
 {
 	struct xdp_sock *xs;
-	u32 nb_pkts;
 
 	rcu_read_lock();
 	if (!list_is_singular(&pool->xsk_tx_list)) {
 		/* Fallback to the non-batched version */
 		rcu_read_unlock();
-		return xsk_tx_peek_release_fallback(pool, max_entries);
+		return xsk_tx_peek_release_fallback(pool, nb_pkts);
 	}
 
 	xs = list_first_or_null_rcu(&pool->xsk_tx_list, struct xdp_sock, tx_list);
@@ -373,12 +372,7 @@ u32 xsk_tx_peek_release_desc_batch(struct xsk_buff_pool *pool, u32 max_entries)
 		goto out;
 	}
 
-	max_entries = xskq_cons_nb_entries(xs->tx, max_entries);
-	nb_pkts = xskq_cons_read_desc_batch(xs->tx, pool, max_entries);
-	if (!nb_pkts) {
-		xs->tx->queue_empty_descs++;
-		goto out;
-	}
+	nb_pkts = xskq_cons_nb_entries(xs->tx, nb_pkts);
 
 	/* This is the backpressure mechanism for the Tx path. Try to
 	 * reserve space in the completion queue for all packets, but
@@ -386,12 +380,18 @@ u32 xsk_tx_peek_release_desc_batch(struct xsk_buff_pool *pool, u32 max_entries)
 	 * packets. This avoids having to implement any buffering in
 	 * the Tx path.
 	 */
-	nb_pkts = xskq_prod_reserve_addr_batch(pool->cq, pool->tx_descs, nb_pkts);
+	nb_pkts = xskq_prod_nb_free(pool->cq, nb_pkts);
 	if (!nb_pkts)
 		goto out;
 
-	xskq_cons_release_n(xs->tx, max_entries);
+	nb_pkts = xskq_cons_read_desc_batch(xs->tx, pool, nb_pkts);
+	if (!nb_pkts) {
+		xs->tx->queue_empty_descs++;
+		goto out;
+	}
+
 	__xskq_cons_release(xs->tx);
+	xskq_prod_write_addr_batch(pool->cq, pool->tx_descs, nb_pkts);
 	xs->sk.sk_write_space(&xs->sk);
 
 out:
@@ -504,14 +504,14 @@ static struct sk_buff *xsk_build_skb(struct xdp_sock *xs,
 
 	skb->dev = dev;
 	skb->priority = xs->sk.sk_priority;
-	skb->mark = xs->sk.sk_mark;
+	skb->mark = READ_ONCE(xs->sk.sk_mark);
 	skb_shinfo(skb)->destructor_arg = (void *)(long)desc->addr;
 	skb->destructor = xsk_destruct_skb;
 
 	return skb;
 }
 
-static int xsk_generic_xmit(struct sock *sk)
+static int __xsk_generic_xmit(struct sock *sk)
 {
 	struct xdp_sock *xs = xdp_sk(sk);
 	u32 max_batch = TX_BATCH_SIZE;
@@ -594,22 +594,13 @@ out:
 	return err;
 }
 
-static int xsk_xmit(struct sock *sk)
+static int xsk_generic_xmit(struct sock *sk)
 {
-	struct xdp_sock *xs = xdp_sk(sk);
 	int ret;
-
-	if (unlikely(!(xs->dev->flags & IFF_UP)))
-		return -ENETDOWN;
-	if (unlikely(!xs->tx))
-		return -ENOBUFS;
-
-	if (xs->zc)
-		return xsk_wakeup(xs, XDP_WAKEUP_TX);
 
 	/* Drop the RCU lock since the SKB path might sleep. */
 	rcu_read_unlock();
-	ret = xsk_generic_xmit(sk);
+	ret = __xsk_generic_xmit(sk);
 	/* Reaquire RCU lock before going into common code. */
 	rcu_read_lock();
 
@@ -627,17 +618,31 @@ static bool xsk_no_wakeup(struct sock *sk)
 #endif
 }
 
+static int xsk_check_common(struct xdp_sock *xs)
+{
+	if (unlikely(!xsk_is_bound(xs)))
+		return -ENXIO;
+	if (unlikely(!(xs->dev->flags & IFF_UP)))
+		return -ENETDOWN;
+
+	return 0;
+}
+
 static int __xsk_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len)
 {
 	bool need_wait = !(m->msg_flags & MSG_DONTWAIT);
 	struct sock *sk = sock->sk;
 	struct xdp_sock *xs = xdp_sk(sk);
 	struct xsk_buff_pool *pool;
+	int err;
 
-	if (unlikely(!xsk_is_bound(xs)))
-		return -ENXIO;
+	err = xsk_check_common(xs);
+	if (err)
+		return err;
 	if (unlikely(need_wait))
 		return -EOPNOTSUPP;
+	if (unlikely(!xs->tx))
+		return -ENOBUFS;
 
 	if (sk_can_busy_loop(sk)) {
 		if (xs->zc)
@@ -649,8 +654,11 @@ static int __xsk_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len
 		return 0;
 
 	pool = xs->pool;
-	if (pool->cached_need_wakeup & XDP_WAKEUP_TX)
-		return xsk_xmit(sk);
+	if (pool->cached_need_wakeup & XDP_WAKEUP_TX) {
+		if (xs->zc)
+			return xsk_wakeup(xs, XDP_WAKEUP_TX);
+		return xsk_generic_xmit(sk);
+	}
 	return 0;
 }
 
@@ -670,11 +678,11 @@ static int __xsk_recvmsg(struct socket *sock, struct msghdr *m, size_t len, int 
 	bool need_wait = !(flags & MSG_DONTWAIT);
 	struct sock *sk = sock->sk;
 	struct xdp_sock *xs = xdp_sk(sk);
+	int err;
 
-	if (unlikely(!xsk_is_bound(xs)))
-		return -ENXIO;
-	if (unlikely(!(xs->dev->flags & IFF_UP)))
-		return -ENETDOWN;
+	err = xsk_check_common(xs);
+	if (err)
+		return err;
 	if (unlikely(!xs->rx))
 		return -ENOBUFS;
 	if (unlikely(need_wait))
@@ -713,26 +721,24 @@ static __poll_t xsk_poll(struct file *file, struct socket *sock,
 	sock_poll_wait(file, sock, wait);
 
 	rcu_read_lock();
-	if (unlikely(!xsk_is_bound(xs))) {
-		rcu_read_unlock();
-		return mask;
-	}
+	if (xsk_check_common(xs))
+		goto out;
 
 	pool = xs->pool;
 
 	if (pool->cached_need_wakeup) {
 		if (xs->zc)
 			xsk_wakeup(xs, pool->cached_need_wakeup);
-		else
+		else if (xs->tx)
 			/* Poll needs to drive Tx also in copy mode */
-			xsk_xmit(sk);
+			xsk_generic_xmit(sk);
 	}
 
 	if (xs->rx && !xskq_prod_is_empty(xs->rx))
 		mask |= EPOLLIN | EPOLLRDNORM;
 	if (xs->tx && xsk_tx_writeable(xs))
 		mask |= EPOLLOUT | EPOLLWRNORM;
-
+out:
 	rcu_read_unlock();
 	return mask;
 }
@@ -879,6 +885,7 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	struct sock *sk = sock->sk;
 	struct xdp_sock *xs = xdp_sk(sk);
 	struct net_device *dev;
+	int bound_dev_if;
 	u32 flags, qid;
 	int err = 0;
 
@@ -890,6 +897,10 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	flags = sxdp->sxdp_flags;
 	if (flags & ~(XDP_SHARED_UMEM | XDP_COPY | XDP_ZEROCOPY |
 		      XDP_USE_NEED_WAKEUP))
+		return -EINVAL;
+
+	bound_dev_if = READ_ONCE(sk->sk_bound_dev_if);
+	if (bound_dev_if && bound_dev_if != sxdp->sxdp_ifindex)
 		return -EINVAL;
 
 	rtnl_lock();
@@ -954,8 +965,8 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 				goto out_unlock;
 			}
 
-			err = xp_assign_dev_shared(xs->pool, umem_xs->umem,
-						   dev, qid);
+			err = xp_assign_dev_shared(xs->pool, umem_xs, dev,
+						   qid);
 			if (err) {
 				xp_destroy(xs->pool);
 				xs->pool = NULL;
@@ -982,6 +993,7 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 				err = xp_alloc_tx_descs(xs->pool, xs);
 				if (err) {
 					xp_put_pool(xs->pool);
+					xs->pool = NULL;
 					sockfd_put(sock);
 					goto out_unlock;
 				}

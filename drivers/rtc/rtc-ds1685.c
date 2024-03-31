@@ -132,7 +132,7 @@ ds1685_rtc_bin2bcd(struct ds1685_priv *rtc, u8 val, u8 bin_mask, u8 bcd_mask)
 }
 
 /**
- * s1685_rtc_check_mday - check validity of the day of month.
+ * ds1685_rtc_check_mday - check validity of the day of month.
  * @rtc: pointer to the ds1685 rtc structure.
  * @mday: day of month.
  *
@@ -1434,7 +1434,7 @@ ds1685_rtc_poweroff(struct platform_device *pdev)
 		unreachable();
 	}
 }
-EXPORT_SYMBOL(ds1685_rtc_poweroff);
+EXPORT_SYMBOL_GPL(ds1685_rtc_poweroff);
 /* ----------------------------------------------------------------------- */
 
 

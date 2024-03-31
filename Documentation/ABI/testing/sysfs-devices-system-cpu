@@ -296,7 +296,7 @@ Description:	Processor frequency boosting control
 
 		This switch controls the boost setting for the whole system.
 		Boosting allows the CPU and the firmware to run at a frequency
-		beyond it's nominal limit.
+		beyond its nominal limit.
 
 		More details can be found in
 		Documentation/admin-guide/pm/cpufreq.rst
@@ -513,16 +513,19 @@ Description:	information about CPUs heterogeneity.
 		cpu_capacity: capacity of cpuX.
 
 What:		/sys/devices/system/cpu/vulnerabilities
-		/sys/devices/system/cpu/vulnerabilities/meltdown
-		/sys/devices/system/cpu/vulnerabilities/spectre_v1
-		/sys/devices/system/cpu/vulnerabilities/spectre_v2
-		/sys/devices/system/cpu/vulnerabilities/spec_store_bypass
+		/sys/devices/system/cpu/vulnerabilities/gather_data_sampling
+		/sys/devices/system/cpu/vulnerabilities/itlb_multihit
 		/sys/devices/system/cpu/vulnerabilities/l1tf
 		/sys/devices/system/cpu/vulnerabilities/mds
+		/sys/devices/system/cpu/vulnerabilities/meltdown
+		/sys/devices/system/cpu/vulnerabilities/mmio_stale_data
+		/sys/devices/system/cpu/vulnerabilities/reg_file_data_sampling
+		/sys/devices/system/cpu/vulnerabilities/retbleed
+		/sys/devices/system/cpu/vulnerabilities/spec_store_bypass
+		/sys/devices/system/cpu/vulnerabilities/spectre_v1
+		/sys/devices/system/cpu/vulnerabilities/spectre_v2
 		/sys/devices/system/cpu/vulnerabilities/srbds
 		/sys/devices/system/cpu/vulnerabilities/tsx_async_abort
-		/sys/devices/system/cpu/vulnerabilities/itlb_multihit
-		/sys/devices/system/cpu/vulnerabilities/mmio_stale_data
 Date:		January 2018
 Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
 Description:	Information about CPU vulnerabilities

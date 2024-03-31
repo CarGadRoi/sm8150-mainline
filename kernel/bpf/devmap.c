@@ -131,13 +131,14 @@ static int dev_map_init_map(struct bpf_dtab *dtab, union bpf_attr *attr)
 	bpf_map_init_from_attr(&dtab->map, attr);
 
 	if (attr->map_type == BPF_MAP_TYPE_DEVMAP_HASH) {
+		/* hash table size must be power of 2; roundup_pow_of_two() can
+		 * overflow into UB on 32-bit arches, so check that first
+		 */
+		if (dtab->map.max_entries > 1UL << 31)
+			return -EINVAL;
+
 		dtab->n_buckets = roundup_pow_of_two(dtab->map.max_entries);
 
-		if (!dtab->n_buckets) /* Overflow check */
-			return -EINVAL;
-	}
-
-	if (attr->map_type == BPF_MAP_TYPE_DEVMAP_HASH) {
 		dtab->dev_index_head = dev_map_create_hash(dtab->n_buckets,
 							   dtab->map.numa_node);
 		if (!dtab->dev_index_head)
@@ -163,13 +164,13 @@ static struct bpf_map *dev_map_alloc(union bpf_attr *attr)
 	if (!capable(CAP_NET_ADMIN))
 		return ERR_PTR(-EPERM);
 
-	dtab = kzalloc(sizeof(*dtab), GFP_USER | __GFP_ACCOUNT);
+	dtab = bpf_map_area_alloc(sizeof(*dtab), NUMA_NO_NODE);
 	if (!dtab)
 		return ERR_PTR(-ENOMEM);
 
 	err = dev_map_init_map(dtab, attr);
 	if (err) {
-		kfree(dtab);
+		bpf_map_area_free(dtab);
 		return ERR_PTR(err);
 	}
 
@@ -240,7 +241,7 @@ static void dev_map_free(struct bpf_map *map)
 		bpf_map_area_free(dtab->netdev_map);
 	}
 
-	kfree(dtab);
+	bpf_map_area_free(dtab);
 }
 
 static int dev_map_get_next_key(struct bpf_map *map, void *key, void *next_key)

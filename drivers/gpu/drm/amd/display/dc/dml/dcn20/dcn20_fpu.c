@@ -30,6 +30,7 @@
 #include "dchubbub.h"
 #include "dcn20/dcn20_resource.h"
 #include "dcn21/dcn21_resource.h"
+#include "clk_mgr/dcn21/rn_clk_mgr.h"
 
 #include "dcn20_fpu.h"
 
@@ -437,7 +438,115 @@ struct _vcs_dpi_soc_bounding_box_st dcn2_0_nv14_soc = {
 	.use_urgent_burst_bw = 0
 };
 
-struct _vcs_dpi_soc_bounding_box_st dcn2_0_nv12_soc = { 0 };
+struct _vcs_dpi_soc_bounding_box_st dcn2_0_nv12_soc = {
+	.clock_limits = {
+		{
+			.state = 0,
+			.dcfclk_mhz = 560.0,
+			.fabricclk_mhz = 560.0,
+			.dispclk_mhz = 513.0,
+			.dppclk_mhz = 513.0,
+			.phyclk_mhz = 540.0,
+			.socclk_mhz = 560.0,
+			.dscclk_mhz = 171.0,
+			.dram_speed_mts = 1069.0,
+		},
+		{
+			.state = 1,
+			.dcfclk_mhz = 694.0,
+			.fabricclk_mhz = 694.0,
+			.dispclk_mhz = 642.0,
+			.dppclk_mhz = 642.0,
+			.phyclk_mhz = 600.0,
+			.socclk_mhz = 694.0,
+			.dscclk_mhz = 214.0,
+			.dram_speed_mts = 1324.0,
+		},
+		{
+			.state = 2,
+			.dcfclk_mhz = 875.0,
+			.fabricclk_mhz = 875.0,
+			.dispclk_mhz = 734.0,
+			.dppclk_mhz = 734.0,
+			.phyclk_mhz = 810.0,
+			.socclk_mhz = 875.0,
+			.dscclk_mhz = 245.0,
+			.dram_speed_mts = 1670.0,
+		},
+		{
+			.state = 3,
+			.dcfclk_mhz = 1000.0,
+			.fabricclk_mhz = 1000.0,
+			.dispclk_mhz = 1100.0,
+			.dppclk_mhz = 1100.0,
+			.phyclk_mhz = 810.0,
+			.socclk_mhz = 1000.0,
+			.dscclk_mhz = 367.0,
+			.dram_speed_mts = 2000.0,
+		},
+		{
+			.state = 4,
+			.dcfclk_mhz = 1200.0,
+			.fabricclk_mhz = 1200.0,
+			.dispclk_mhz = 1284.0,
+			.dppclk_mhz = 1284.0,
+			.phyclk_mhz = 810.0,
+			.socclk_mhz = 1200.0,
+			.dscclk_mhz = 428.0,
+			.dram_speed_mts = 2000.0,
+		},
+		{
+			.state = 5,
+			.dcfclk_mhz = 1200.0,
+			.fabricclk_mhz = 1200.0,
+			.dispclk_mhz = 1284.0,
+			.dppclk_mhz = 1284.0,
+			.phyclk_mhz = 810.0,
+			.socclk_mhz = 1200.0,
+			.dscclk_mhz = 428.0,
+			.dram_speed_mts = 2000.0,
+		},
+	},
+
+	.num_states = 5,
+	.sr_exit_time_us = 1.9,
+	.sr_enter_plus_exit_time_us = 4.4,
+	.urgent_latency_us = 3.0,
+	.urgent_latency_pixel_data_only_us = 4.0,
+	.urgent_latency_pixel_mixed_with_vm_data_us = 4.0,
+	.urgent_latency_vm_data_only_us = 4.0,
+	.urgent_out_of_order_return_per_channel_pixel_only_bytes = 4096,
+	.urgent_out_of_order_return_per_channel_pixel_and_vm_bytes = 4096,
+	.urgent_out_of_order_return_per_channel_vm_only_bytes = 4096,
+	.pct_ideal_dram_sdp_bw_after_urgent_pixel_only = 40.0,
+	.pct_ideal_dram_sdp_bw_after_urgent_pixel_and_vm = 40.0,
+	.pct_ideal_dram_sdp_bw_after_urgent_vm_only = 40.0,
+	.max_avg_sdp_bw_use_normal_percent = 40.0,
+	.max_avg_dram_bw_use_normal_percent = 40.0,
+	.writeback_latency_us = 12.0,
+	.ideal_dram_bw_after_urgent_percent = 40.0,
+	.max_request_size_bytes = 256,
+	.dram_channel_width_bytes = 16,
+	.fabric_datapath_to_dcn_data_return_bytes = 64,
+	.dcn_downspread_percent = 0.5,
+	.downspread_percent = 0.5,
+	.dram_page_open_time_ns = 50.0,
+	.dram_rw_turnaround_time_ns = 17.5,
+	.dram_return_buffer_per_channel_bytes = 8192,
+	.round_trip_ping_latency_dcfclk_cycles = 131,
+	.urgent_out_of_order_return_per_channel_bytes = 4096,
+	.channel_interleave_bytes = 256,
+	.num_banks = 8,
+	.num_chans = 16,
+	.vmm_page_size_bytes = 4096,
+	.dram_clock_change_latency_us = 45.0,
+	.writeback_dram_clock_change_latency_us = 23.0,
+	.return_bus_width_bytes = 64,
+	.dispclk_dppclk_vco_speed_mhz = 3850,
+	.xfc_bus_transport_time_us = 20,
+	.xfc_xbuf_latency_tolerance_us = 50,
+	.use_urgent_burst_bw = 0,
+};
 
 struct _vcs_dpi_ip_params_st dcn2_1_ip = {
 	.odm_capable = 1,
@@ -947,10 +1056,8 @@ static enum dcn_zstate_support_state  decide_zstate_support(struct dc *dc, struc
 {
 	int plane_count;
 	int i;
-	unsigned int optimized_min_dst_y_next_start_us;
 
 	plane_count = 0;
-	optimized_min_dst_y_next_start_us = 0;
 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
 		if (context->res_ctx.pipe_ctx[i].plane_state)
 			plane_count++;
@@ -962,6 +1069,8 @@ static enum dcn_zstate_support_state  decide_zstate_support(struct dc *dc, struc
 	 * 	2. single eDP, on link 0, 1 plane and stutter period > 5ms
 	 * Z10 only cases:
 	 * 	1. single eDP, on link 0, 1 plane and stutter period >= 5ms
+	 * Z8 cases:
+	 * 	1. stutter period sufficient
 	 * Zstate not allowed cases:
 	 * 	1. Everything else
 	 */
@@ -970,30 +1079,23 @@ static enum dcn_zstate_support_state  decide_zstate_support(struct dc *dc, struc
 	else if (context->stream_count == 1 &&  context->streams[0]->signal == SIGNAL_TYPE_EDP) {
 		struct dc_link *link = context->streams[0]->sink->link;
 		struct dc_stream_status *stream_status = &context->stream_status[0];
+		int minmum_z8_residency = dc->debug.minimum_z8_residency_time > 0 ? dc->debug.minimum_z8_residency_time : 1000;
+		bool allow_z8 = context->bw_ctx.dml.vba.StutterPeriod > (double)minmum_z8_residency;
+		bool is_pwrseq0 = link->link_index == 0;
 
-		if (dc_extended_blank_supported(dc)) {
-			for (i = 0; i < dc->res_pool->pipe_count; i++) {
-				if (context->res_ctx.pipe_ctx[i].stream == context->streams[0]
-					&& context->res_ctx.pipe_ctx[i].stream->adjust.v_total_min == context->res_ctx.pipe_ctx[i].stream->adjust.v_total_max
-					&& context->res_ctx.pipe_ctx[i].stream->adjust.v_total_min > context->res_ctx.pipe_ctx[i].stream->timing.v_total) {
-						optimized_min_dst_y_next_start_us =
-							context->res_ctx.pipe_ctx[i].dlg_regs.optimized_min_dst_y_next_start_us;
-						break;
-				}
-			}
-		}
-		/* zstate only supported on PWRSEQ0  and when there's <2 planes*/
-		if (link->link_index != 0 || stream_status->plane_count > 1)
+		/* Don't support multi-plane configurations */
+		if (stream_status->plane_count > 1)
 			return DCN_ZSTATE_SUPPORT_DISALLOW;
 
-		if (context->bw_ctx.dml.vba.StutterPeriod > 5000.0 || optimized_min_dst_y_next_start_us > 5000)
+		if (is_pwrseq0 && context->bw_ctx.dml.vba.StutterPeriod > 5000.0)
 			return DCN_ZSTATE_SUPPORT_ALLOW;
-		else if (link->psr_settings.psr_version == DC_PSR_VERSION_1 && !dc->debug.disable_psr)
-			return DCN_ZSTATE_SUPPORT_ALLOW_Z10_ONLY;
+		else if (is_pwrseq0 && link->psr_settings.psr_version == DC_PSR_VERSION_1 && !link->panel_config.psr.disable_psr)
+			return allow_z8 ? DCN_ZSTATE_SUPPORT_ALLOW_Z8_Z10_ONLY : DCN_ZSTATE_SUPPORT_ALLOW_Z10_ONLY;
 		else
-			return DCN_ZSTATE_SUPPORT_DISALLOW;
-	} else
+			return allow_z8 ? DCN_ZSTATE_SUPPORT_ALLOW_Z8_ONLY : DCN_ZSTATE_SUPPORT_DISALLOW;
+	} else {
 		return DCN_ZSTATE_SUPPORT_DISALLOW;
+	}
 }
 
 void dcn20_calculate_dlg_params(
@@ -1227,6 +1329,7 @@ int dcn20_populate_dml_pipes_from_context(
 		pipes[pipe_cnt].pipe.src.dcc = false;
 		pipes[pipe_cnt].pipe.src.dcc_rate = 1;
 		pipes[pipe_cnt].pipe.dest.synchronized_vblank_all_planes = synchronized_vblank;
+		pipes[pipe_cnt].pipe.dest.synchronize_timings = synchronized_vblank;
 		pipes[pipe_cnt].pipe.dest.hblank_start = timing->h_total - timing->h_front_porch;
 		pipes[pipe_cnt].pipe.dest.hblank_end = pipes[pipe_cnt].pipe.dest.hblank_start
 				- timing->h_addressable
@@ -2233,6 +2336,7 @@ static struct _vcs_dpi_voltage_scaling_st construct_low_pstate_lvl(struct clk_li
 
 void dcn21_update_bw_bounding_box(struct dc *dc, struct clk_bw_params *bw_params)
 {
+	struct _vcs_dpi_voltage_scaling_st *s = dc->scratch.update_bw_bounding_box.clock_limits;
 	struct dcn21_resource_pool *pool = TO_DCN21_RES_POOL(dc->res_pool);
 	struct clk_limit_table *clk_table = &bw_params->clk_table;
 	unsigned int i, closest_clk_lvl = 0, k = 0;
@@ -2246,8 +2350,7 @@ void dcn21_update_bw_bounding_box(struct dc *dc, struct clk_bw_params *bw_params
 
 	ASSERT(clk_table->num_entries);
 	/* Copy dcn2_1_soc.clock_limits to clock_limits to avoid copying over null states later */
-	memcpy(&dcn2_1_soc._clock_tmp, &dcn2_1_soc.clock_limits,
-	       sizeof(dcn2_1_soc.clock_limits));
+	memcpy(s, dcn2_1_soc.clock_limits, sizeof(dcn2_1_soc.clock_limits));
 
 	for (i = 0; i < clk_table->num_entries; i++) {
 		/* loop backwards*/
@@ -2262,25 +2365,25 @@ void dcn21_update_bw_bounding_box(struct dc *dc, struct clk_bw_params *bw_params
 		if (i == 1)
 			k++;
 
-		dcn2_1_soc._clock_tmp[k].state = k;
-		dcn2_1_soc._clock_tmp[k].dcfclk_mhz = clk_table->entries[i].dcfclk_mhz;
-		dcn2_1_soc._clock_tmp[k].fabricclk_mhz = clk_table->entries[i].fclk_mhz;
-		dcn2_1_soc._clock_tmp[k].socclk_mhz = clk_table->entries[i].socclk_mhz;
-		dcn2_1_soc._clock_tmp[k].dram_speed_mts = clk_table->entries[i].memclk_mhz * 2;
+		s[k].state = k;
+		s[k].dcfclk_mhz = clk_table->entries[i].dcfclk_mhz;
+		s[k].fabricclk_mhz = clk_table->entries[i].fclk_mhz;
+		s[k].socclk_mhz = clk_table->entries[i].socclk_mhz;
+		s[k].dram_speed_mts = clk_table->entries[i].memclk_mhz * 2;
 
-		dcn2_1_soc._clock_tmp[k].dispclk_mhz = dcn2_1_soc.clock_limits[closest_clk_lvl].dispclk_mhz;
-		dcn2_1_soc._clock_tmp[k].dppclk_mhz = dcn2_1_soc.clock_limits[closest_clk_lvl].dppclk_mhz;
-		dcn2_1_soc._clock_tmp[k].dram_bw_per_chan_gbps = dcn2_1_soc.clock_limits[closest_clk_lvl].dram_bw_per_chan_gbps;
-		dcn2_1_soc._clock_tmp[k].dscclk_mhz = dcn2_1_soc.clock_limits[closest_clk_lvl].dscclk_mhz;
-		dcn2_1_soc._clock_tmp[k].dtbclk_mhz = dcn2_1_soc.clock_limits[closest_clk_lvl].dtbclk_mhz;
-		dcn2_1_soc._clock_tmp[k].phyclk_d18_mhz = dcn2_1_soc.clock_limits[closest_clk_lvl].phyclk_d18_mhz;
-		dcn2_1_soc._clock_tmp[k].phyclk_mhz = dcn2_1_soc.clock_limits[closest_clk_lvl].phyclk_mhz;
+		s[k].dispclk_mhz = dcn2_1_soc.clock_limits[closest_clk_lvl].dispclk_mhz;
+		s[k].dppclk_mhz = dcn2_1_soc.clock_limits[closest_clk_lvl].dppclk_mhz;
+		s[k].dram_bw_per_chan_gbps =
+			dcn2_1_soc.clock_limits[closest_clk_lvl].dram_bw_per_chan_gbps;
+		s[k].dscclk_mhz = dcn2_1_soc.clock_limits[closest_clk_lvl].dscclk_mhz;
+		s[k].dtbclk_mhz = dcn2_1_soc.clock_limits[closest_clk_lvl].dtbclk_mhz;
+		s[k].phyclk_d18_mhz = dcn2_1_soc.clock_limits[closest_clk_lvl].phyclk_d18_mhz;
+		s[k].phyclk_mhz = dcn2_1_soc.clock_limits[closest_clk_lvl].phyclk_mhz;
 
 		k++;
 	}
 
-	memcpy(&dcn2_1_soc.clock_limits, &dcn2_1_soc._clock_tmp,
-	       sizeof(dcn2_1_soc.clock_limits));
+	memcpy(dcn2_1_soc.clock_limits, s, sizeof(dcn2_1_soc.clock_limits));
 
 	if (clk_table->num_entries) {
 		dcn2_1_soc.num_states = clk_table->num_entries + 1;

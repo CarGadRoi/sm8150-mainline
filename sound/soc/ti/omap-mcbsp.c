@@ -74,14 +74,16 @@ static int omap2_mcbsp_set_clks_src(struct omap_mcbsp *mcbsp, u8 fck_src_id)
 		return -EINVAL;
 	}
 
-	pm_runtime_put_sync(mcbsp->dev);
+	if (mcbsp->active)
+		pm_runtime_put_sync(mcbsp->dev);
 
 	r = clk_set_parent(mcbsp->fclk, fck_src);
 	if (r)
 		dev_err(mcbsp->dev, "CLKS: could not clk_set_parent() to %s\n",
 			src);
 
-	pm_runtime_get_sync(mcbsp->dev);
+	if (mcbsp->active)
+		pm_runtime_get_sync(mcbsp->dev);
 
 	clk_put(fck_src);
 
@@ -517,7 +519,7 @@ static ssize_t prop##_show(struct device *dev,				\
 {									\
 	struct omap_mcbsp *mcbsp = dev_get_drvdata(dev);		\
 									\
-	return sprintf(buf, "%u\n", mcbsp->prop);			\
+	return sysfs_emit(buf, "%u\n", mcbsp->prop);			\
 }									\
 									\
 static ssize_t prop##_store(struct device *dev,				\
@@ -560,11 +562,11 @@ static ssize_t dma_op_mode_show(struct device *dev,
 
 	for (s = &dma_op_modes[i]; i < ARRAY_SIZE(dma_op_modes); s++, i++) {
 		if (dma_op_mode == i)
-			len += sprintf(buf + len, "[%s] ", *s);
+			len += sysfs_emit_at(buf, len, "[%s] ", *s);
 		else
-			len += sprintf(buf + len, "%s ", *s);
+			len += sysfs_emit_at(buf, len, "%s ", *s);
 	}
-	len += sprintf(buf + len, "\n");
+	len += sysfs_emit_at(buf, len, "\n");
 
 	return len;
 }
@@ -614,7 +616,7 @@ static int omap_mcbsp_init(struct platform_device *pdev)
 {
 	struct omap_mcbsp *mcbsp = platform_get_drvdata(pdev);
 	struct resource *res;
-	int ret = 0;
+	int ret;
 
 	spin_lock_init(&mcbsp->lock);
 	mcbsp->free = true;

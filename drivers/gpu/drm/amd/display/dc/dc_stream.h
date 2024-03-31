@@ -41,6 +41,10 @@ struct timing_sync_info {
 struct dc_stream_status {
 	int primary_otg_inst;
 	int stream_enc_inst;
+
+	/**
+	 * @plane_count: Total of planes attached to a single stream
+	 */
 	int plane_count;
 	int audio_inst;
 	struct timing_sync_info timing_sync_info;
@@ -127,6 +131,7 @@ union stream_update_flags {
 		uint32_t dsc_changed : 1;
 		uint32_t mst_bw : 1;
 		uint32_t crtc_timing_adjust : 1;
+		uint32_t fams_changed : 1;
 	} bits;
 
 	uint32_t raw;
@@ -197,7 +202,18 @@ struct dc_stream_state {
 	bool use_vsc_sdp_for_colorimetry;
 	bool ignore_msa_timing_param;
 
+	/**
+	 * @allow_freesync:
+	 *
+	 * It say if Freesync is enabled or not.
+	 */
 	bool allow_freesync;
+
+	/**
+	 * @vrr_active_variable:
+	 *
+	 * It describes if VRR is in use.
+	 */
 	bool vrr_active_variable;
 	bool freesync_on_desktop;
 
@@ -212,8 +228,7 @@ struct dc_stream_state {
 	/* DMCU info */
 	unsigned int abm_level;
 
-	struct periodic_interrupt_config periodic_interrupt0;
-	struct periodic_interrupt_config periodic_interrupt1;
+	struct periodic_interrupt_config periodic_interrupt;
 
 	/* from core_stream struct */
 	struct dc_context *ctx;
@@ -268,8 +283,6 @@ struct dc_stream_state {
 	bool has_non_synchronizable_pclk;
 	bool vblank_synchronized;
 	struct mall_stream_config mall_stream_config;
-
-	bool odm_2to1_policy_applied;
 };
 
 #define ABM_LEVEL_IMMEDIATE_DISABLE 255
@@ -283,8 +296,7 @@ struct dc_stream_update {
 	struct dc_info_packet *hdr_static_metadata;
 	unsigned int *abm_level;
 
-	struct periodic_interrupt_config *periodic_interrupt0;
-	struct periodic_interrupt_config *periodic_interrupt1;
+	struct periodic_interrupt_config *periodic_interrupt;
 
 	struct dc_info_packet *vrr_infopacket;
 	struct dc_info_packet *vsc_infopacket;

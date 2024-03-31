@@ -59,7 +59,6 @@
 #include <linux/mm_types.h>
 #include <linux/mmzone.h>
 #include <asm/fixmap.h>
-#include <asm/io.h>
 
 struct mm_struct;
 struct vm_area_struct;
@@ -145,7 +144,7 @@ static inline void set_p4d(p4d_t *p4d, p4d_t p4dval)
 	*p4d = p4dval;
 }
 
-#define p4d_phys(p4d)		virt_to_phys((void *)p4d_val(p4d))
+#define p4d_phys(p4d)		PHYSADDR(p4d_val(p4d))
 #define p4d_page(p4d)		(pfn_to_page(p4d_phys(p4d) >> PAGE_SHIFT))
 
 #endif
@@ -188,7 +187,7 @@ static inline pmd_t *pud_pgtable(pud_t pud)
 
 #define set_pud(pudptr, pudval) do { *(pudptr) = (pudval); } while (0)
 
-#define pud_phys(pud)		virt_to_phys((void *)pud_val(pud))
+#define pud_phys(pud)		PHYSADDR(pud_val(pud))
 #define pud_page(pud)		(pfn_to_page(pud_phys(pud) >> PAGE_SHIFT))
 
 #endif
@@ -209,7 +208,7 @@ static inline int pmd_bad(pmd_t pmd)
 static inline int pmd_present(pmd_t pmd)
 {
 	if (unlikely(pmd_val(pmd) & _PAGE_HUGE))
-		return !!(pmd_val(pmd) & (_PAGE_PRESENT | _PAGE_PROTNONE));
+		return !!(pmd_val(pmd) & (_PAGE_PRESENT | _PAGE_PROTNONE | _PAGE_PRESENT_INVALID));
 
 	return pmd_val(pmd) != (unsigned long)invalid_pte_table;
 }
@@ -221,7 +220,7 @@ static inline void pmd_clear(pmd_t *pmdp)
 
 #define set_pmd(pmdptr, pmdval) do { *(pmdptr) = (pmdval); } while (0)
 
-#define pmd_phys(pmd)		virt_to_phys((void *)pmd_val(pmd))
+#define pmd_phys(pmd)		PHYSADDR(pmd_val(pmd))
 
 #ifndef CONFIG_TRANSPARENT_HUGEPAGE
 #define pmd_page(pmd)		(pfn_to_page(pmd_phys(pmd) >> PAGE_SHIFT))
@@ -350,13 +349,17 @@ static inline pte_t pte_mkclean(pte_t pte)
 
 static inline pte_t pte_mkdirty(pte_t pte)
 {
-	pte_val(pte) |= (_PAGE_DIRTY | _PAGE_MODIFIED);
+	pte_val(pte) |= _PAGE_MODIFIED;
+	if (pte_val(pte) & _PAGE_WRITE)
+		pte_val(pte) |= _PAGE_DIRTY;
 	return pte;
 }
 
 static inline pte_t pte_mkwrite(pte_t pte)
 {
-	pte_val(pte) |= (_PAGE_WRITE | _PAGE_DIRTY);
+	pte_val(pte) |= _PAGE_WRITE;
+	if (pte_val(pte) & _PAGE_MODIFIED)
+		pte_val(pte) |= _PAGE_DIRTY;
 	return pte;
 }
 
@@ -413,6 +416,9 @@ static inline void update_mmu_cache(struct vm_area_struct *vma,
 	__update_tlb(vma, address, ptep);
 }
 
+#define __HAVE_ARCH_UPDATE_MMU_TLB
+#define update_mmu_tlb	update_mmu_cache
+
 static inline void update_mmu_cache_pmd(struct vm_area_struct *vma,
 			unsigned long address, pmd_t *pmdp)
 {
@@ -453,7 +459,9 @@ static inline int pmd_write(pmd_t pmd)
 
 static inline pmd_t pmd_mkwrite(pmd_t pmd)
 {
-	pmd_val(pmd) |= (_PAGE_WRITE | _PAGE_DIRTY);
+	pmd_val(pmd) |= _PAGE_WRITE;
+	if (pmd_val(pmd) & _PAGE_MODIFIED)
+		pmd_val(pmd) |= _PAGE_DIRTY;
 	return pmd;
 }
 
@@ -476,10 +484,13 @@ static inline pmd_t pmd_mkclean(pmd_t pmd)
 
 static inline pmd_t pmd_mkdirty(pmd_t pmd)
 {
-	pmd_val(pmd) |= (_PAGE_DIRTY | _PAGE_MODIFIED);
+	pmd_val(pmd) |= _PAGE_MODIFIED;
+	if (pmd_val(pmd) & _PAGE_WRITE)
+		pmd_val(pmd) |= _PAGE_DIRTY;
 	return pmd;
 }
 
+#define pmd_young pmd_young
 static inline int pmd_young(pmd_t pmd)
 {
 	return !!(pmd_val(pmd) & _PAGE_ACCESSED);
@@ -514,6 +525,7 @@ static inline pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot)
 
 static inline pmd_t pmd_mkinvalid(pmd_t pmd)
 {
+	pmd_val(pmd) |= _PAGE_PRESENT_INVALID;
 	pmd_val(pmd) &= ~(_PAGE_PRESENT | _PAGE_VALID | _PAGE_DIRTY | _PAGE_PROTNONE);
 
 	return pmd;
@@ -547,6 +559,9 @@ static inline long pmd_protnone(pmd_t pmd)
 	return (pmd_val(pmd) & _PAGE_PROTNONE);
 }
 #endif /* CONFIG_NUMA_BALANCING */
+
+#define pmd_leaf(pmd)		((pmd_val(pmd) & _PAGE_HUGE) != 0)
+#define pud_leaf(pud)		((pud_val(pud) & _PAGE_HUGE) != 0)
 
 /*
  * We provide our own get_unmapped area to cope with the virtual aliasing

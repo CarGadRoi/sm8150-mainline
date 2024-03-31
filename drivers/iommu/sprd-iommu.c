@@ -147,15 +147,9 @@ static struct iommu_domain *sprd_iommu_domain_alloc(unsigned int domain_type)
 
 	dom->domain.geometry.aperture_start = 0;
 	dom->domain.geometry.aperture_end = SZ_256M - 1;
+	dom->domain.geometry.force_aperture = true;
 
 	return &dom->domain;
-}
-
-static void sprd_iommu_domain_free(struct iommu_domain *domain)
-{
-	struct sprd_iommu_domain *dom = to_sprd_domain(domain);
-
-	kfree(dom);
 }
 
 static void sprd_iommu_first_vpn(struct sprd_iommu_domain *dom)
@@ -228,6 +222,28 @@ static void sprd_iommu_hw_en(struct sprd_iommu_device *sdev, bool en)
 	mask = SPRD_IOMMU_EN | SPRD_IOMMU_GATE_EN;
 	val = en ? mask : 0;
 	sprd_iommu_update_bits(sdev, reg_cfg, mask, 0, val);
+}
+
+static void sprd_iommu_cleanup(struct sprd_iommu_domain *dom)
+{
+	size_t pgt_size;
+
+	/* Nothing need to do if the domain hasn't been attached */
+	if (!dom->sdev)
+		return;
+
+	pgt_size = sprd_iommu_pgt_size(&dom->domain);
+	dma_free_coherent(dom->sdev->dev, pgt_size, dom->pgt_va, dom->pgt_pa);
+	dom->sdev = NULL;
+	sprd_iommu_hw_en(dom->sdev, false);
+}
+
+static void sprd_iommu_domain_free(struct iommu_domain *domain)
+{
+	struct sprd_iommu_domain *dom = to_sprd_domain(domain);
+
+	sprd_iommu_cleanup(dom);
+	kfree(dom);
 }
 
 static int sprd_iommu_attach_device(struct iommu_domain *domain,
@@ -496,9 +512,6 @@ static int sprd_iommu_probe(struct platform_device *pdev)
 	if (ret)
 		goto remove_sysfs;
 
-	if (!iommu_present(&platform_bus_type))
-		bus_set_iommu(&platform_bus_type, &sprd_iommu_ops);
-
 	ret = sprd_iommu_clk_enable(sdev);
 	if (ret)
 		goto unregister_iommu;
@@ -533,8 +546,6 @@ static int sprd_iommu_remove(struct platform_device *pdev)
 
 	iommu_group_put(sdev->group);
 	sdev->group = NULL;
-
-	bus_set_iommu(&platform_bus_type, NULL);
 
 	platform_set_drvdata(pdev, NULL);
 	iommu_device_sysfs_remove(&sdev->iommu);

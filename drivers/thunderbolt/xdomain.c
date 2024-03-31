@@ -704,6 +704,27 @@ out_unlock:
 	mutex_unlock(&xdomain_lock);
 }
 
+static void start_handshake(struct tb_xdomain *xd)
+{
+	xd->state = XDOMAIN_STATE_INIT;
+	queue_delayed_work(xd->tb->wq, &xd->state_work,
+			   msecs_to_jiffies(XDOMAIN_SHORT_TIMEOUT));
+}
+
+/* Can be called from state_work */
+static void __stop_handshake(struct tb_xdomain *xd)
+{
+	cancel_delayed_work_sync(&xd->properties_changed_work);
+	xd->properties_changed_retries = 0;
+	xd->state_retries = 0;
+}
+
+static void stop_handshake(struct tb_xdomain *xd)
+{
+	cancel_delayed_work_sync(&xd->state_work);
+	__stop_handshake(xd);
+}
+
 static void tb_xdp_handle_request(struct work_struct *work)
 {
 	struct xdomain_request_work *xw = container_of(work, typeof(*xw), work);
@@ -766,6 +787,15 @@ static void tb_xdp_handle_request(struct work_struct *work)
 	case UUID_REQUEST:
 		tb_dbg(tb, "%llx: received XDomain UUID request\n", route);
 		ret = tb_xdp_uuid_response(ctl, route, sequence, uuid);
+		/*
+		 * If we've stopped the discovery with an error such as
+		 * timing out, we will restart the handshake now that we
+		 * received UUID request from the remote host.
+		 */
+		if (!ret && xd && xd->state == XDOMAIN_STATE_ERROR) {
+			dev_dbg(&xd->dev, "restarting handshake\n");
+			start_handshake(xd);
+		}
 		break;
 
 	case LINK_STATE_STATUS_REQUEST:
@@ -877,7 +907,7 @@ static ssize_t key_show(struct device *dev, struct device_attribute *attr,
 	 * It should be null terminated but anything else is pretty much
 	 * allowed.
 	 */
-	return sprintf(buf, "%*pE\n", (int)strlen(svc->key), svc->key);
+	return sysfs_emit(buf, "%*pE\n", (int)strlen(svc->key), svc->key);
 }
 static DEVICE_ATTR_RO(key);
 
@@ -903,7 +933,7 @@ static ssize_t prtcid_show(struct device *dev, struct device_attribute *attr,
 {
 	struct tb_service *svc = container_of(dev, struct tb_service, dev);
 
-	return sprintf(buf, "%u\n", svc->prtcid);
+	return sysfs_emit(buf, "%u\n", svc->prtcid);
 }
 static DEVICE_ATTR_RO(prtcid);
 
@@ -912,7 +942,7 @@ static ssize_t prtcvers_show(struct device *dev, struct device_attribute *attr,
 {
 	struct tb_service *svc = container_of(dev, struct tb_service, dev);
 
-	return sprintf(buf, "%u\n", svc->prtcvers);
+	return sysfs_emit(buf, "%u\n", svc->prtcvers);
 }
 static DEVICE_ATTR_RO(prtcvers);
 
@@ -921,7 +951,7 @@ static ssize_t prtcrevs_show(struct device *dev, struct device_attribute *attr,
 {
 	struct tb_service *svc = container_of(dev, struct tb_service, dev);
 
-	return sprintf(buf, "%u\n", svc->prtcrevs);
+	return sysfs_emit(buf, "%u\n", svc->prtcrevs);
 }
 static DEVICE_ATTR_RO(prtcrevs);
 
@@ -930,7 +960,7 @@ static ssize_t prtcstns_show(struct device *dev, struct device_attribute *attr,
 {
 	struct tb_service *svc = container_of(dev, struct tb_service, dev);
 
-	return sprintf(buf, "0x%08x\n", svc->prtcstns);
+	return sysfs_emit(buf, "0x%08x\n", svc->prtcstns);
 }
 static DEVICE_ATTR_RO(prtcstns);
 
@@ -1129,11 +1159,6 @@ static int populate_properties(struct tb_xdomain *xd,
 		xd->vendor_name = kstrdup(p->value.text, GFP_KERNEL);
 
 	return 0;
-}
-
-static inline struct tb_switch *tb_xdomain_parent(struct tb_xdomain *xd)
-{
-	return tb_to_switch(xd->dev.parent);
 }
 
 static int tb_xdomain_update_link_attributes(struct tb_xdomain *xd)
@@ -1424,12 +1449,19 @@ static int tb_xdomain_get_properties(struct tb_xdomain *xd)
 	 * registered, we notify the userspace that it has changed.
 	 */
 	if (!update) {
-		struct tb_port *port;
+		/*
+		 * Now disable lane 1 if bonding was not enabled. Do
+		 * this only if bonding was possible at the beginning
+		 * (that is we are the connection manager and there are
+		 * two lanes).
+		 */
+		if (xd->bonding_possible) {
+			struct tb_port *port;
 
-		/* Now disable lane 1 if bonding was not enabled */
-		port = tb_port_at(xd->route, tb_xdomain_parent(xd));
-		if (!port->bonded)
-			tb_port_disable(port->dual_link_port);
+			port = tb_port_at(xd->route, tb_xdomain_parent(xd));
+			if (!port->bonded)
+				tb_port_disable(port->dual_link_port);
+		}
 
 		if (device_add(&xd->dev)) {
 			dev_err(&xd->dev, "failed to add XDomain device\n");
@@ -1440,6 +1472,8 @@ static int tb_xdomain_get_properties(struct tb_xdomain *xd)
 		if (xd->vendor_name && xd->device_name)
 			dev_info(&xd->dev, "%s %s\n", xd->vendor_name,
 				 xd->device_name);
+
+		tb_xdomain_debugfs_init(xd);
 	} else {
 		kobject_uevent(&xd->dev.kobj, KOBJ_CHANGE);
 	}
@@ -1518,6 +1552,13 @@ static void tb_xdomain_queue_properties_changed(struct tb_xdomain *xd)
 			   msecs_to_jiffies(XDOMAIN_SHORT_TIMEOUT));
 }
 
+static void tb_xdomain_failed(struct tb_xdomain *xd)
+{
+	xd->state = XDOMAIN_STATE_ERROR;
+	queue_delayed_work(xd->tb->wq, &xd->state_work,
+			   msecs_to_jiffies(XDOMAIN_DEFAULT_TIMEOUT));
+}
+
 static void tb_xdomain_state_work(struct work_struct *work)
 {
 	struct tb_xdomain *xd = container_of(work, typeof(*xd), state_work.work);
@@ -1544,7 +1585,7 @@ static void tb_xdomain_state_work(struct work_struct *work)
 		if (ret) {
 			if (ret == -EAGAIN)
 				goto retry_state;
-			xd->state = XDOMAIN_STATE_ERROR;
+			tb_xdomain_failed(xd);
 		} else {
 			tb_xdomain_queue_properties_changed(xd);
 			if (xd->bonding_possible)
@@ -1609,7 +1650,7 @@ static void tb_xdomain_state_work(struct work_struct *work)
 		if (ret) {
 			if (ret == -EAGAIN)
 				goto retry_state;
-			xd->state = XDOMAIN_STATE_ERROR;
+			tb_xdomain_failed(xd);
 		} else {
 			xd->state = XDOMAIN_STATE_ENUMERATED;
 		}
@@ -1620,6 +1661,8 @@ static void tb_xdomain_state_work(struct work_struct *work)
 		break;
 
 	case XDOMAIN_STATE_ERROR:
+		dev_dbg(&xd->dev, "discovery failed, stopping handshake\n");
+		__stop_handshake(xd);
 		break;
 
 	default:
@@ -1664,7 +1707,7 @@ static ssize_t device_show(struct device *dev, struct device_attribute *attr,
 {
 	struct tb_xdomain *xd = container_of(dev, struct tb_xdomain, dev);
 
-	return sprintf(buf, "%#x\n", xd->device);
+	return sysfs_emit(buf, "%#x\n", xd->device);
 }
 static DEVICE_ATTR_RO(device);
 
@@ -1676,7 +1719,7 @@ device_name_show(struct device *dev, struct device_attribute *attr, char *buf)
 
 	if (mutex_lock_interruptible(&xd->lock))
 		return -ERESTARTSYS;
-	ret = sprintf(buf, "%s\n", xd->device_name ? xd->device_name : "");
+	ret = sysfs_emit(buf, "%s\n", xd->device_name ?: "");
 	mutex_unlock(&xd->lock);
 
 	return ret;
@@ -1688,7 +1731,7 @@ static ssize_t maxhopid_show(struct device *dev, struct device_attribute *attr,
 {
 	struct tb_xdomain *xd = container_of(dev, struct tb_xdomain, dev);
 
-	return sprintf(buf, "%d\n", xd->remote_max_hopid);
+	return sysfs_emit(buf, "%d\n", xd->remote_max_hopid);
 }
 static DEVICE_ATTR_RO(maxhopid);
 
@@ -1697,7 +1740,7 @@ static ssize_t vendor_show(struct device *dev, struct device_attribute *attr,
 {
 	struct tb_xdomain *xd = container_of(dev, struct tb_xdomain, dev);
 
-	return sprintf(buf, "%#x\n", xd->vendor);
+	return sysfs_emit(buf, "%#x\n", xd->vendor);
 }
 static DEVICE_ATTR_RO(vendor);
 
@@ -1709,7 +1752,7 @@ vendor_name_show(struct device *dev, struct device_attribute *attr, char *buf)
 
 	if (mutex_lock_interruptible(&xd->lock))
 		return -ERESTARTSYS;
-	ret = sprintf(buf, "%s\n", xd->vendor_name ? xd->vendor_name : "");
+	ret = sysfs_emit(buf, "%s\n", xd->vendor_name ?: "");
 	mutex_unlock(&xd->lock);
 
 	return ret;
@@ -1721,7 +1764,7 @@ static ssize_t unique_id_show(struct device *dev, struct device_attribute *attr,
 {
 	struct tb_xdomain *xd = container_of(dev, struct tb_xdomain, dev);
 
-	return sprintf(buf, "%pUb\n", xd->remote_uuid);
+	return sysfs_emit(buf, "%pUb\n", xd->remote_uuid);
 }
 static DEVICE_ATTR_RO(unique_id);
 
@@ -1730,7 +1773,7 @@ static ssize_t speed_show(struct device *dev, struct device_attribute *attr,
 {
 	struct tb_xdomain *xd = container_of(dev, struct tb_xdomain, dev);
 
-	return sprintf(buf, "%u.0 Gb/s\n", xd->link_speed);
+	return sysfs_emit(buf, "%u.0 Gb/s\n", xd->link_speed);
 }
 
 static DEVICE_ATTR(rx_speed, 0444, speed_show, NULL);
@@ -1741,7 +1784,7 @@ static ssize_t lanes_show(struct device *dev, struct device_attribute *attr,
 {
 	struct tb_xdomain *xd = container_of(dev, struct tb_xdomain, dev);
 
-	return sprintf(buf, "%u\n", xd->link_width);
+	return sysfs_emit(buf, "%u\n", xd->link_width);
 }
 
 static DEVICE_ATTR(rx_lanes, 0444, lanes_show, NULL);
@@ -1787,21 +1830,6 @@ static void tb_xdomain_release(struct device *dev)
 	kfree(xd->device_name);
 	kfree(xd->vendor_name);
 	kfree(xd);
-}
-
-static void start_handshake(struct tb_xdomain *xd)
-{
-	xd->state = XDOMAIN_STATE_INIT;
-	queue_delayed_work(xd->tb->wq, &xd->state_work,
-			   msecs_to_jiffies(XDOMAIN_SHORT_TIMEOUT));
-}
-
-static void stop_handshake(struct tb_xdomain *xd)
-{
-	cancel_delayed_work_sync(&xd->properties_changed_work);
-	cancel_delayed_work_sync(&xd->state_work);
-	xd->properties_changed_retries = 0;
-	xd->state_retries = 0;
 }
 
 static int __maybe_unused tb_xdomain_suspend(struct device *dev)
@@ -1940,6 +1968,8 @@ static int unregister_service(struct device *dev, void *data)
  */
 void tb_xdomain_remove(struct tb_xdomain *xd)
 {
+	tb_xdomain_debugfs_remove(xd);
+
 	stop_handshake(xd);
 
 	device_for_each_child_reverse(&xd->dev, xd, unregister_service);
@@ -2438,7 +2468,7 @@ int tb_xdomain_init(void)
 	tb_property_add_immediate(xdomain_property_dir, "deviceid", 0x1);
 	tb_property_add_immediate(xdomain_property_dir, "devicerv", 0x80000100);
 
-	xdomain_property_block_gen = prandom_u32();
+	xdomain_property_block_gen = get_random_u32();
 	return 0;
 }
 

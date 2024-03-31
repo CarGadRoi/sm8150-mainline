@@ -2057,7 +2057,7 @@ int tomoyo_supervisor(struct tomoyo_request_info *r, const char *fmt, ...)
 	bool quota_exceeded = false;
 
 	va_start(args, fmt);
-	len = vsnprintf((char *) &len, 1, fmt, args) + 1;
+	len = vsnprintf(NULL, 0, fmt, args) + 1;
 	va_end(args);
 	/* Write /sys/kernel/security/tomoyo/audit. */
 	va_start(args, fmt);
@@ -2648,13 +2648,14 @@ ssize_t tomoyo_write_control(struct tomoyo_io_buffer *head,
 {
 	int error = buffer_len;
 	size_t avail_len = buffer_len;
-	char *cp0 = head->write_buf;
+	char *cp0;
 	int idx;
 
 	if (!head->write)
 		return -EINVAL;
 	if (mutex_lock_interruptible(&head->io_sem))
 		return -EINTR;
+	cp0 = head->write_buf;
 	head->read_user_buf_avail = 0;
 	idx = tomoyo_read_lock();
 	/* Read a line and dispatch it to the policy handler. */

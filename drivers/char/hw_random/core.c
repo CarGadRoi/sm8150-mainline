@@ -24,9 +24,12 @@
 #include <linux/random.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 
 #define RNG_MODULE_NAME		"hw_random"
+
+#define RNG_BUFFER_SIZE (SMP_CACHE_BYTES < 32 ? 32 : SMP_CACHE_BYTES)
 
 static struct hwrng *current_rng;
 /* the current rng has been explicitly chosen by user via sysfs */
@@ -52,14 +55,14 @@ MODULE_PARM_DESC(default_quality,
 
 static void drop_current_rng(void);
 static int hwrng_init(struct hwrng *rng);
-static void hwrng_manage_rngd(struct hwrng *rng);
+static int hwrng_fillfn(void *unused);
 
 static inline int rng_get_data(struct hwrng *rng, u8 *buffer, size_t size,
 			       int wait);
 
 static size_t rng_buffer_size(void)
 {
-	return SMP_CACHE_BYTES < 32 ? 32 : SMP_CACHE_BYTES;
+	return RNG_BUFFER_SIZE;
 }
 
 static void add_early_randomness(struct hwrng *rng)
@@ -95,6 +98,15 @@ static int set_current_rng(struct hwrng *rng)
 
 	drop_current_rng();
 	current_rng = rng;
+
+	/* if necessary, start hwrng thread */
+	if (!hwrng_fill) {
+		hwrng_fill = kthread_run(hwrng_fillfn, NULL, "hwrng");
+		if (IS_ERR(hwrng_fill)) {
+			pr_err("hwrng_fill thread creation failed\n");
+			hwrng_fill = NULL;
+		}
+	}
 
 	return 0;
 }
@@ -167,8 +179,6 @@ skip_init:
 		rng->quality = 1024;
 	current_quality = rng->quality; /* obsolete */
 
-	hwrng_manage_rngd(rng);
-
 	return 0;
 }
 
@@ -204,6 +214,7 @@ static inline int rng_get_data(struct hwrng *rng, u8 *buffer, size_t size,
 static ssize_t rng_dev_read(struct file *filp, char __user *buf,
 			    size_t size, loff_t *offp)
 {
+	u8 buffer[RNG_BUFFER_SIZE];
 	ssize_t ret = 0;
 	int err = 0;
 	int bytes_read, len;
@@ -231,34 +242,37 @@ static ssize_t rng_dev_read(struct file *filp, char __user *buf,
 			if (bytes_read < 0) {
 				err = bytes_read;
 				goto out_unlock_reading;
-			}
-			data_avail = bytes_read;
-		}
-
-		if (!data_avail) {
-			if (filp->f_flags & O_NONBLOCK) {
+			} else if (bytes_read == 0 &&
+				   (filp->f_flags & O_NONBLOCK)) {
 				err = -EAGAIN;
 				goto out_unlock_reading;
 			}
-		} else {
-			len = data_avail;
+
+			data_avail = bytes_read;
+		}
+
+		len = data_avail;
+		if (len) {
 			if (len > size)
 				len = size;
 
 			data_avail -= len;
 
-			if (copy_to_user(buf + ret, rng_buffer + data_avail,
-								len)) {
+			memcpy(buffer, rng_buffer + data_avail, len);
+		}
+		mutex_unlock(&reading_mutex);
+		put_rng(rng);
+
+		if (len) {
+			if (copy_to_user(buf + ret, buffer, len)) {
 				err = -EFAULT;
-				goto out_unlock_reading;
+				goto out;
 			}
 
 			size -= len;
 			ret += len;
 		}
 
-		mutex_unlock(&reading_mutex);
-		put_rng(rng);
 
 		if (need_resched())
 			schedule_timeout_interruptible(1);
@@ -269,6 +283,7 @@ static ssize_t rng_dev_read(struct file *filp, char __user *buf,
 		}
 	}
 out:
+	memzero_explicit(buffer, sizeof(buffer));
 	return ret ? : err;
 
 out_unlock_reading:
@@ -454,10 +469,6 @@ static ssize_t rng_quality_store(struct device *dev,
 	/* the best available RNG may have changed */
 	ret = enable_best_rng();
 
-	/* start/stop rngd if necessary */
-	if (current_rng)
-		hwrng_manage_rngd(current_rng);
-
 out:
 	mutex_unlock(&rng_mutex);
 	return ret ? ret : len;
@@ -507,16 +518,14 @@ static int hwrng_fillfn(void *unused)
 			rng->quality = current_quality; /* obsolete */
 		quality = rng->quality;
 		mutex_unlock(&reading_mutex);
+
+		if (rc <= 0)
+			hwrng_msleep(rng, 10000);
+
 		put_rng(rng);
 
-		if (!quality)
-			break;
-
-		if (rc <= 0) {
-			pr_warn("hwrng: no data available\n");
-			msleep_interruptible(10000);
+		if (rc <= 0)
 			continue;
-		}
 
 		/* If we cannot credit at least one bit of entropy,
 		 * keep track of the remainder for the next iteration
@@ -531,22 +540,6 @@ static int hwrng_fillfn(void *unused)
 	}
 	hwrng_fill = NULL;
 	return 0;
-}
-
-static void hwrng_manage_rngd(struct hwrng *rng)
-{
-	if (WARN_ON(!mutex_is_locked(&rng_mutex)))
-		return;
-
-	if (rng->quality == 0 && hwrng_fill)
-		kthread_stop(hwrng_fill);
-	if (rng->quality > 0 && !hwrng_fill) {
-		hwrng_fill = kthread_run(hwrng_fillfn, NULL, "hwrng");
-		if (IS_ERR(hwrng_fill)) {
-			pr_err("hwrng_fill thread creation failed\n");
-			hwrng_fill = NULL;
-		}
-	}
 }
 
 int hwrng_register(struct hwrng *rng)
@@ -570,6 +563,7 @@ int hwrng_register(struct hwrng *rng)
 
 	init_completion(&rng->cleanup_done);
 	complete(&rng->cleanup_done);
+	init_completion(&rng->dying);
 
 	if (!current_rng ||
 	    (!cur_rng_set_by_user && rng->quality > current_rng->quality)) {
@@ -617,6 +611,7 @@ void hwrng_unregister(struct hwrng *rng)
 
 	old_rng = current_rng;
 	list_del(&rng->list);
+	complete_all(&rng->dying);
 	if (current_rng == rng) {
 		err = enable_best_rng();
 		if (err) {
@@ -684,6 +679,20 @@ void devm_hwrng_unregister(struct device *dev, struct hwrng *rng)
 	devres_release(dev, devm_hwrng_release, devm_hwrng_match, rng);
 }
 EXPORT_SYMBOL_GPL(devm_hwrng_unregister);
+
+long hwrng_msleep(struct hwrng *rng, unsigned int msecs)
+{
+	unsigned long timeout = msecs_to_jiffies(msecs) + 1;
+
+	return wait_for_completion_interruptible_timeout(&rng->dying, timeout);
+}
+EXPORT_SYMBOL_GPL(hwrng_msleep);
+
+long hwrng_yield(struct hwrng *rng)
+{
+	return wait_for_completion_interruptible_timeout(&rng->dying, 1);
+}
+EXPORT_SYMBOL_GPL(hwrng_yield);
 
 static int __init hwrng_modinit(void)
 {

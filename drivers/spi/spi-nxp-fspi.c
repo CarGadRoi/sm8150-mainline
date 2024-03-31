@@ -588,7 +588,7 @@ static int nxp_fspi_clk_prep_enable(struct nxp_fspi *f)
 {
 	int ret;
 
-	if (is_acpi_node(f->dev->fwnode))
+	if (is_acpi_node(dev_fwnode(f->dev)))
 		return 0;
 
 	ret = clk_prepare_enable(f->clk_en);
@@ -606,7 +606,7 @@ static int nxp_fspi_clk_prep_enable(struct nxp_fspi *f)
 
 static int nxp_fspi_clk_disable_unprep(struct nxp_fspi *f)
 {
-	if (is_acpi_node(f->dev->fwnode))
+	if (is_acpi_node(dev_fwnode(f->dev)))
 		return 0;
 
 	clk_disable_unprepare(f->clk);
@@ -708,7 +708,7 @@ static int nxp_fspi_read_ahb(struct nxp_fspi *f, const struct spi_mem_op *op)
 		f->memmap_len = len > NXP_FSPI_MIN_IOMAP ?
 				len : NXP_FSPI_MIN_IOMAP;
 
-		f->ahb_addr = ioremap_wc(f->memmap_phy + f->memmap_start,
+		f->ahb_addr = ioremap(f->memmap_phy + f->memmap_start,
 					 f->memmap_len);
 
 		if (!f->ahb_addr) {
@@ -1029,6 +1029,13 @@ static int nxp_fspi_default_setup(struct nxp_fspi *f)
 	fspi_writel(f, FSPI_AHBCR_PREF_EN | FSPI_AHBCR_RDADDROPT,
 		 base + FSPI_AHBCR);
 
+	/* Reset the FLSHxCR1 registers. */
+	reg = FSPI_FLSHXCR1_TCSH(0x3) | FSPI_FLSHXCR1_TCSS(0x3);
+	fspi_writel(f, reg, base + FSPI_FLSHA1CR1);
+	fspi_writel(f, reg, base + FSPI_FLSHA2CR1);
+	fspi_writel(f, reg, base + FSPI_FLSHB1CR1);
+	fspi_writel(f, reg, base + FSPI_FLSHB2CR1);
+
 	/* AHB Read - Set lut sequence ID for all CS. */
 	fspi_writel(f, SEQID_LUT, base + FSPI_FLSHA1CR2);
 	fspi_writel(f, SEQID_LUT, base + FSPI_FLSHA2CR2);
@@ -1100,7 +1107,7 @@ static int nxp_fspi_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, f);
 
 	/* find the resources - configuration register address space */
-	if (is_acpi_node(f->dev->fwnode))
+	if (is_acpi_node(dev_fwnode(f->dev)))
 		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	else
 		res = platform_get_resource_byname(pdev,
@@ -1113,7 +1120,7 @@ static int nxp_fspi_probe(struct platform_device *pdev)
 	}
 
 	/* find the resources - controller memory mapped space */
-	if (is_acpi_node(f->dev->fwnode))
+	if (is_acpi_node(dev_fwnode(f->dev)))
 		res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
 	else
 		res = platform_get_resource_byname(pdev,

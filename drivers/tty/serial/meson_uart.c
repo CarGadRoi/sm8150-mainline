@@ -335,7 +335,7 @@ static void meson_uart_change_speed(struct uart_port *port, unsigned long baud)
 
 static void meson_uart_set_termios(struct uart_port *port,
 				   struct ktermios *termios,
-				   struct ktermios *old)
+				   const struct ktermios *old)
 {
 	unsigned int cflags, iflags, baud;
 	unsigned long flags;
@@ -380,10 +380,14 @@ static void meson_uart_set_termios(struct uart_port *port,
 	else
 		val |= AML_UART_STOP_BIT_1SB;
 
-	if (cflags & CRTSCTS)
-		val &= ~AML_UART_TWO_WIRE_EN;
-	else
+	if (cflags & CRTSCTS) {
+		if (port->flags & UPF_HARD_FLOW)
+			val &= ~AML_UART_TWO_WIRE_EN;
+		else
+			termios->c_cflag &= ~CRTSCTS;
+	} else {
 		val |= AML_UART_TWO_WIRE_EN;
+	}
 
 	writel(val, port->membase + AML_UART_CONTROL);
 
@@ -667,29 +671,6 @@ static struct uart_driver meson_uart_driver = {
 	.cons		= MESON_SERIAL_CONSOLE,
 };
 
-static inline struct clk *meson_uart_probe_clock(struct device *dev,
-						 const char *id)
-{
-	struct clk *clk = NULL;
-	int ret;
-
-	clk = devm_clk_get(dev, id);
-	if (IS_ERR(clk))
-		return clk;
-
-	ret = clk_prepare_enable(clk);
-	if (ret) {
-		dev_err(dev, "couldn't enable clk\n");
-		return ERR_PTR(ret);
-	}
-
-	devm_add_action_or_reset(dev,
-			(void(*)(void *))clk_disable_unprepare,
-			clk);
-
-	return clk;
-}
-
 static int meson_uart_probe_clocks(struct platform_device *pdev,
 				   struct uart_port *port)
 {
@@ -697,15 +678,15 @@ static int meson_uart_probe_clocks(struct platform_device *pdev,
 	struct clk *clk_pclk = NULL;
 	struct clk *clk_baud = NULL;
 
-	clk_pclk = meson_uart_probe_clock(&pdev->dev, "pclk");
+	clk_pclk = devm_clk_get_enabled(&pdev->dev, "pclk");
 	if (IS_ERR(clk_pclk))
 		return PTR_ERR(clk_pclk);
 
-	clk_xtal = meson_uart_probe_clock(&pdev->dev, "xtal");
+	clk_xtal = devm_clk_get_enabled(&pdev->dev, "xtal");
 	if (IS_ERR(clk_xtal))
 		return PTR_ERR(clk_xtal);
 
-	clk_baud = meson_uart_probe_clock(&pdev->dev, "baud");
+	clk_baud = devm_clk_get_enabled(&pdev->dev, "baud");
 	if (IS_ERR(clk_baud))
 		return PTR_ERR(clk_baud);
 
@@ -721,6 +702,7 @@ static int meson_uart_probe(struct platform_device *pdev)
 	u32 fifosize = 64; /* Default is 64, 128 for EE UART_0 */
 	int ret = 0;
 	int irq;
+	bool has_rtscts;
 
 	if (pdev->dev.of_node)
 		pdev->id = of_alias_get_id(pdev->dev.of_node, "serial");
@@ -748,6 +730,7 @@ static int meson_uart_probe(struct platform_device *pdev)
 		return irq;
 
 	of_property_read_u32(pdev->dev.of_node, "fifo-size", &fifosize);
+	has_rtscts = of_property_read_bool(pdev->dev.of_node, "uart-has-rtscts");
 
 	if (meson_ports[pdev->id]) {
 		dev_err(&pdev->dev, "port %d already allocated\n", pdev->id);
@@ -767,6 +750,8 @@ static int meson_uart_probe(struct platform_device *pdev)
 	port->mapsize = resource_size(res_mem);
 	port->irq = irq;
 	port->flags = UPF_BOOT_AUTOCONF | UPF_LOW_LATENCY;
+	if (has_rtscts)
+		port->flags |= UPF_HARD_FLOW;
 	port->has_sysrq = IS_ENABLED(CONFIG_SERIAL_MESON_CONSOLE);
 	port->dev = &pdev->dev;
 	port->line = pdev->id;

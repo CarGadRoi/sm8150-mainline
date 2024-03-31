@@ -221,7 +221,7 @@ static void geneve_rx(struct geneve_dev *geneve, struct geneve_sock *gs,
 	struct genevehdr *gnvh = geneve_hdr(skb);
 	struct metadata_dst *tun_dst = NULL;
 	unsigned int len;
-	int err = 0;
+	int nh, err = 0;
 	void *oiph;
 
 	if (ip_tunnel_collect_metadata() || gs->collect_md) {
@@ -272,8 +272,22 @@ static void geneve_rx(struct geneve_dev *geneve, struct geneve_sock *gs,
 		skb->pkt_type = PACKET_HOST;
 	}
 
-	oiph = skb_network_header(skb);
+	/* Save offset of outer header relative to skb->head,
+	 * because we are going to reset the network header to the inner header
+	 * and might change skb->head.
+	 */
+	nh = skb_network_header(skb) - skb->head;
+
 	skb_reset_network_header(skb);
+
+	if (!pskb_inet_may_pull(skb)) {
+		DEV_STATS_INC(geneve->dev, rx_length_errors);
+		DEV_STATS_INC(geneve->dev, rx_errors);
+		goto drop;
+	}
+
+	/* Get the outer header. */
+	oiph = skb->head + nh;
 
 	if (geneve_get_sk_family(gs) == AF_INET)
 		err = IP_ECN_decapsulate(oiph, skb);
@@ -503,12 +517,9 @@ static struct sk_buff *geneve_gro_receive(struct sock *sk,
 
 	off_gnv = skb_gro_offset(skb);
 	hlen = off_gnv + sizeof(*gh);
-	gh = skb_gro_header_fast(skb, off_gnv);
-	if (skb_gro_header_hard(skb, hlen)) {
-		gh = skb_gro_header_slow(skb, hlen, off_gnv);
-		if (unlikely(!gh))
-			goto out;
-	}
+	gh = skb_gro_header(skb, hlen, off_gnv);
+	if (unlikely(!gh))
+		goto out;
 
 	if (gh->ver != GENEVE_VER || gh->oam)
 		goto out;
@@ -1200,8 +1211,8 @@ static const struct net_device_ops geneve_netdev_ops = {
 static void geneve_get_drvinfo(struct net_device *dev,
 			       struct ethtool_drvinfo *drvinfo)
 {
-	strlcpy(drvinfo->version, GENEVE_NETDEV_VER, sizeof(drvinfo->version));
-	strlcpy(drvinfo->driver, "geneve", sizeof(drvinfo->driver));
+	strscpy(drvinfo->version, GENEVE_NETDEV_VER, sizeof(drvinfo->version));
+	strscpy(drvinfo->driver, "geneve", sizeof(drvinfo->driver));
 }
 
 static const struct ethtool_ops geneve_ethtool_ops = {

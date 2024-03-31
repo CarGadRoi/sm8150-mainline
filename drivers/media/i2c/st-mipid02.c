@@ -736,8 +736,13 @@ static void mipid02_set_fmt_source(struct v4l2_subdev *sd,
 {
 	struct mipid02_dev *bridge = to_mipid02_dev(sd);
 
-	/* source pad mirror active sink pad */
-	format->format = bridge->fmt;
+	/* source pad mirror sink pad */
+	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE)
+		format->format = bridge->fmt;
+	else
+		format->format = *v4l2_subdev_get_try_format(sd, sd_state,
+							     MIPID02_SINK_0);
+
 	/* but code may need to be converted */
 	format->format.code = serial_to_parallel_code(format->format.code);
 
@@ -1067,7 +1072,7 @@ mutex_cleanup:
 	return ret;
 }
 
-static int mipid02_remove(struct i2c_client *client)
+static void mipid02_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct mipid02_dev *bridge = to_mipid02_dev(sd);
@@ -1078,8 +1083,6 @@ static int mipid02_remove(struct i2c_client *client)
 	mipid02_set_power_off(bridge);
 	media_entity_cleanup(&bridge->sd.entity);
 	mutex_destroy(&bridge->lock);
-
-	return 0;
 }
 
 static const struct of_device_id mipid02_dt_ids[] = {

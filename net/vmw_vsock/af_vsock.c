@@ -89,6 +89,7 @@
 #include <linux/types.h>
 #include <linux/bitops.h>
 #include <linux/cred.h>
+#include <linux/errqueue.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -110,6 +111,7 @@
 #include <linux/workqueue.h>
 #include <net/sock.h>
 #include <net/af_vsock.h>
+#include <uapi/linux/vm_sockets.h>
 
 static int __vsock_bind(struct sock *sk, struct sockaddr_vm *addr);
 static void vsock_sk_destruct(struct sock *sk);
@@ -882,6 +884,16 @@ s64 vsock_stream_has_space(struct vsock_sock *vsk)
 }
 EXPORT_SYMBOL_GPL(vsock_stream_has_space);
 
+void vsock_data_ready(struct sock *sk)
+{
+	struct vsock_sock *vsk = vsock_sk(sk);
+
+	if (vsock_stream_has_data(vsk) >= sk->sk_rcvlowat ||
+	    sock_flag(sk, SOCK_DONE))
+		sk->sk_data_ready(sk);
+}
+EXPORT_SYMBOL_GPL(vsock_data_ready);
+
 static int vsock_release(struct socket *sock)
 {
 	__vsock_release(sock->sk, 0);
@@ -1066,8 +1078,9 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 		if (transport && transport->stream_is_active(vsk) &&
 		    !(sk->sk_shutdown & RCV_SHUTDOWN)) {
 			bool data_ready_now = false;
+			int target = sock_rcvlowat(sk, 0, INT_MAX);
 			int ret = transport->notify_poll_in(
-					vsk, 1, &data_ready_now);
+					vsk, target, &data_ready_now);
 			if (ret < 0) {
 				mask |= EPOLLERR;
 			} else {
@@ -1416,7 +1429,7 @@ static int vsock_connect(struct socket *sock, struct sockaddr *addr,
 			vsock_transport_cancel_pkt(vsk);
 			vsock_remove_connected(vsk);
 			goto out_wait;
-		} else if (timeout == 0) {
+		} else if ((sk->sk_state != TCP_ESTABLISHED) && (timeout == 0)) {
 			err = -ETIMEDOUT;
 			sk->sk_state = TCP_CLOSE;
 			sock->state = SS_UNCONNECTED;
@@ -1894,8 +1907,11 @@ static int vsock_connectible_wait_data(struct sock *sk,
 	err = 0;
 	transport = vsk->transport;
 
-	while ((data = vsock_connectible_has_data(vsk)) == 0) {
+	while (1) {
 		prepare_to_wait(sk_sleep(sk), wait, TASK_INTERRUPTIBLE);
+		data = vsock_connectible_has_data(vsk);
+		if (data != 0)
+			break;
 
 		if (sk->sk_err != 0 ||
 		    (sk->sk_shutdown & RCV_SHUTDOWN) ||
@@ -2081,9 +2097,11 @@ vsock_connectible_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
 	const struct vsock_transport *transport;
 	int err;
 
-	DEFINE_WAIT(wait);
-
 	sk = sock->sk;
+
+	if (unlikely(flags & MSG_ERRQUEUE))
+		return sock_recv_errqueue(sk, msg, len, SOL_VSOCK, VSOCK_RECVERR);
+
 	vsk = vsock_sk(sk);
 	err = 0;
 
@@ -2137,6 +2155,25 @@ out:
 	return err;
 }
 
+static int vsock_set_rcvlowat(struct sock *sk, int val)
+{
+	const struct vsock_transport *transport;
+	struct vsock_sock *vsk;
+
+	vsk = vsock_sk(sk);
+
+	if (val > vsk->buffer_size)
+		return -EINVAL;
+
+	transport = vsk->transport;
+
+	if (transport && transport->set_rcvlowat)
+		return transport->set_rcvlowat(vsk, val);
+
+	WRITE_ONCE(sk->sk_rcvlowat, val ? : 1);
+	return 0;
+}
+
 static const struct proto_ops vsock_stream_ops = {
 	.family = PF_VSOCK,
 	.owner = THIS_MODULE,
@@ -2156,6 +2193,7 @@ static const struct proto_ops vsock_stream_ops = {
 	.recvmsg = vsock_connectible_recvmsg,
 	.mmap = sock_no_mmap,
 	.sendpage = sock_no_sendpage,
+	.set_rcvlowat = vsock_set_rcvlowat,
 };
 
 static const struct proto_ops vsock_seqpacket_ops = {

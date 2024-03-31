@@ -635,6 +635,12 @@ int arch_decode_instruction(struct objtool_file *file, const struct section *sec
 		*type = INSN_CONTEXT_SWITCH;
 		break;
 
+	case 0xe0: /* loopne */
+	case 0xe1: /* loope */
+	case 0xe2: /* loop */
+		*type = INSN_JUMP_CONDITIONAL;
+		break;
+
 	case 0xe8:
 		*type = INSN_CALL;
 		/*
@@ -791,4 +797,10 @@ bool arch_is_retpoline(struct symbol *sym)
 bool arch_is_rethunk(struct symbol *sym)
 {
 	return !strcmp(sym->name, "__x86_return_thunk");
+}
+
+bool arch_is_embedded_insn(struct symbol *sym)
+{
+	return !strcmp(sym->name, "retbleed_return_thunk") ||
+	       !strcmp(sym->name, "srso_safe_ret");
 }

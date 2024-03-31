@@ -95,9 +95,6 @@ module_param(debug_dump_wdg, bool, 0444);
 MODULE_PARM_DESC(debug_dump_wdg,
 		 "Dump available WMI interfaces [0/1]");
 
-static int acpi_wmi_remove(struct platform_device *device);
-static int acpi_wmi_probe(struct platform_device *device);
-
 static const struct acpi_device_id wmi_device_ids[] = {
 	{"PNP0C14", 0},
 	{"pnp0c14", 0},
@@ -105,13 +102,10 @@ static const struct acpi_device_id wmi_device_ids[] = {
 };
 MODULE_DEVICE_TABLE(acpi, wmi_device_ids);
 
-static struct platform_driver acpi_wmi_driver = {
-	.driver = {
-		.name = "acpi-wmi",
-		.acpi_match_table = wmi_device_ids,
-	},
-	.probe = acpi_wmi_probe,
-	.remove = acpi_wmi_remove,
+/* allow duplicate GUIDs as these device drivers use struct wmi_driver */
+static const char * const allow_duplicates[] = {
+	"05901221-D566-11D1-B2F0-00A0C9062910",	/* wmi-bmof */
+	NULL
 };
 
 /*
@@ -141,6 +135,16 @@ static acpi_status find_guid(const char *guid_string, struct wmi_block **out)
 	return AE_NOT_FOUND;
 }
 
+static bool guid_parse_and_compare(const char *string, const guid_t *guid)
+{
+	guid_t guid_input;
+
+	if (guid_parse(string, &guid_input))
+		return false;
+
+	return guid_equal(&guid_input, guid);
+}
+
 static const void *find_guid_context(struct wmi_block *wblock,
 				     struct wmi_driver *wdriver)
 {
@@ -151,11 +155,7 @@ static const void *find_guid_context(struct wmi_block *wblock,
 		return NULL;
 
 	while (*id->guid_string) {
-		guid_t guid_input;
-
-		if (guid_parse(id->guid_string, &guid_input))
-			continue;
-		if (guid_equal(&wblock->gblock.guid, &guid_input))
+		if (guid_parse_and_compare(id->guid_string, &wblock->gblock.guid))
 			return id->context;
 		id++;
 	}
@@ -839,11 +839,7 @@ static int wmi_dev_match(struct device *dev, struct device_driver *driver)
 		return 0;
 
 	while (*id->guid_string) {
-		guid_t driver_guid;
-
-		if (WARN_ON(guid_parse(id->guid_string, &driver_guid)))
-			continue;
-		if (guid_equal(&driver_guid, &wblock->gblock.guid))
+		if (guid_parse_and_compare(id->guid_string, &wblock->gblock.guid))
 			return 1;
 
 		id++;
@@ -853,21 +849,13 @@ static int wmi_dev_match(struct device *dev, struct device_driver *driver)
 }
 static int wmi_char_open(struct inode *inode, struct file *filp)
 {
-	const char *driver_name = filp->f_path.dentry->d_iname;
-	struct wmi_block *wblock;
-	struct wmi_block *next;
+	/*
+	 * The miscdevice already stores a pointer to itself
+	 * inside filp->private_data
+	 */
+	struct wmi_block *wblock = container_of(filp->private_data, struct wmi_block, char_dev);
 
-	list_for_each_entry_safe(wblock, next, &wmi_block_list, list) {
-		if (!wblock->dev.dev.driver)
-			continue;
-		if (strcmp(driver_name, wblock->dev.dev.driver->name) == 0) {
-			filp->private_data = wblock;
-			break;
-		}
-	}
-
-	if (!filp->private_data)
-		return -ENODEV;
+	filp->private_data = wblock;
 
 	return nonseekable_open(inode, filp);
 }
@@ -1073,6 +1061,23 @@ static const struct device_type wmi_type_data = {
 	.release = wmi_dev_release,
 };
 
+/*
+ * _WDG is a static list that is only parsed at startup,
+ * so it's safe to count entries without extra protection.
+ */
+static int guid_count(const guid_t *guid)
+{
+	struct wmi_block *wblock;
+	int count = 0;
+
+	list_for_each_entry(wblock, &wmi_block_list, list) {
+		if (guid_equal(&wblock->gblock.guid, guid))
+			count++;
+	}
+
+	return count;
+}
+
 static int wmi_create_device(struct device *wmi_bus_dev,
 			     struct wmi_block *wblock,
 			     struct acpi_device *device)
@@ -1080,6 +1085,7 @@ static int wmi_create_device(struct device *wmi_bus_dev,
 	struct acpi_device_info *info;
 	char method[WMI_ACPI_METHOD_NAME_SIZE];
 	int result;
+	uint count;
 
 	if (wblock->gblock.flags & ACPI_WMI_EVENT) {
 		wblock->dev.dev.type = &wmi_type_event;
@@ -1134,7 +1140,11 @@ static int wmi_create_device(struct device *wmi_bus_dev,
 	wblock->dev.dev.bus = &wmi_bus_type;
 	wblock->dev.dev.parent = wmi_bus_dev;
 
-	dev_set_name(&wblock->dev.dev, "%pUL", &wblock->gblock.guid);
+	count = guid_count(&wblock->gblock.guid);
+	if (count)
+		dev_set_name(&wblock->dev.dev, "%pUL-%d", &wblock->gblock.guid, count);
+	else
+		dev_set_name(&wblock->dev.dev, "%pUL", &wblock->gblock.guid);
 
 	device_initialize(&wblock->dev.dev);
 
@@ -1154,11 +1164,20 @@ static void wmi_free_devices(struct acpi_device *device)
 	}
 }
 
-static bool guid_already_parsed(struct acpi_device *device, const guid_t *guid)
+static bool guid_already_parsed_for_legacy(struct acpi_device *device, const guid_t *guid)
 {
 	struct wmi_block *wblock;
 
 	list_for_each_entry(wblock, &wmi_block_list, list) {
+		/* skip warning and register if we know the driver will use struct wmi_driver */
+		for (int i = 0; allow_duplicates[i] != NULL; i++) {
+			guid_t tmp;
+
+			if (guid_parse(allow_duplicates[i], &tmp))
+				continue;
+			if (guid_equal(&tmp, guid))
+				return false;
+		}
 		if (guid_equal(&wblock->gblock.guid, guid)) {
 			/*
 			 * Because we historically didn't track the relationship
@@ -1185,8 +1204,8 @@ static int parse_wdg(struct device *wmi_bus_dev, struct acpi_device *device)
 	struct wmi_block *wblock, *next;
 	union acpi_object *obj;
 	acpi_status status;
-	int retval = 0;
 	u32 i, total;
+	int retval;
 
 	status = acpi_evaluate_object(device->handle, "_WDG", NULL, &out);
 	if (ACPI_FAILURE(status))
@@ -1197,8 +1216,8 @@ static int parse_wdg(struct device *wmi_bus_dev, struct acpi_device *device)
 		return -ENXIO;
 
 	if (obj->type != ACPI_TYPE_BUFFER) {
-		retval = -ENXIO;
-		goto out_free_pointer;
+		kfree(obj);
+		return -ENXIO;
 	}
 
 	gblock = (const struct guid_block *)obj->buffer.pointer;
@@ -1208,19 +1227,18 @@ static int parse_wdg(struct device *wmi_bus_dev, struct acpi_device *device)
 		if (debug_dump_wdg)
 			wmi_dump_wdg(&gblock[i]);
 
-		/*
-		 * Some WMI devices, like those for nVidia hooks, have a
-		 * duplicate GUID. It's not clear what we should do in this
-		 * case yet, so for now, we'll just ignore the duplicate
-		 * for device creation.
-		 */
-		if (guid_already_parsed(device, &gblock[i].guid))
+		if (!gblock[i].instance_count) {
+			dev_info(wmi_bus_dev, FW_INFO "%pUL has zero instances\n", &gblock[i].guid);
+			continue;
+		}
+
+		if (guid_already_parsed_for_legacy(device, &gblock[i].guid))
 			continue;
 
 		wblock = kzalloc(sizeof(*wblock), GFP_KERNEL);
 		if (!wblock) {
-			retval = -ENOMEM;
-			break;
+			dev_err(wmi_bus_dev, "Failed to allocate %pUL\n", &gblock[i].guid);
+			continue;
 		}
 
 		wblock->acpi_device = device;
@@ -1259,9 +1277,9 @@ static int parse_wdg(struct device *wmi_bus_dev, struct acpi_device *device)
 		}
 	}
 
-out_free_pointer:
-	kfree(out.pointer);
-	return retval;
+	kfree(obj);
+
+	return 0;
 }
 
 /*
@@ -1448,6 +1466,15 @@ void wmi_driver_unregister(struct wmi_driver *driver)
 	driver_unregister(&driver->driver);
 }
 EXPORT_SYMBOL(wmi_driver_unregister);
+
+static struct platform_driver acpi_wmi_driver = {
+	.driver = {
+		.name = "acpi-wmi",
+		.acpi_match_table = wmi_device_ids,
+	},
+	.probe = acpi_wmi_probe,
+	.remove = acpi_wmi_remove,
+};
 
 static int __init acpi_wmi_init(void)
 {

@@ -53,6 +53,8 @@ enum utf16_endian;
 #define E_NTFS_NONRESIDENT		556
 /* NTFS specific error code about punch hole. */
 #define E_NTFS_NOTALIGNED		557
+/* NTFS specific error code when on-disk struct is corrupted. */
+#define E_NTFS_CORRUPT			558
 
 
 /* sbi->flags */
@@ -220,6 +222,7 @@ struct ntfs_sb_info {
 
 	u32 flags; // See NTFS_FLAGS_XXX.
 
+	CLST zone_max; // Maximum MFT zone length in clusters
 	CLST bad_clusters; // The count of marked bad clusters.
 
 	u16 max_bytes_per_attr; // Maximum attribute size in record.
@@ -408,8 +411,6 @@ enum REPARSE_SIGN {
 };
 
 /* Functions from attrib.c */
-int attr_load_runs(struct ATTRIB *attr, struct ntfs_inode *ni,
-		   struct runs_tree *run, const CLST *vcn);
 int attr_allocate_clusters(struct ntfs_sb_info *sbi, struct runs_tree *run,
 			   CLST vcn, CLST lcn, CLST len, CLST *pre_alloc,
 			   enum ALLOCATE_OPT opt, CLST *alen, const size_t fr,
@@ -440,6 +441,7 @@ int attr_is_frame_compressed(struct ntfs_inode *ni, struct ATTRIB *attr,
 int attr_allocate_frame(struct ntfs_inode *ni, CLST frame, size_t compr_size,
 			u64 new_valid);
 int attr_collapse_range(struct ntfs_inode *ni, u64 vbo, u64 bytes);
+int attr_insert_range(struct ntfs_inode *ni, u64 vbo, u64 bytes);
 int attr_punch_hole(struct ntfs_inode *ni, u64 vbo, u64 bytes, u32 *frame_size);
 
 /* Functions from attrlist.c */
@@ -465,7 +467,7 @@ bool al_delete_le(struct ntfs_inode *ni, enum ATTR_TYPE type, CLST vcn,
 int al_update(struct ntfs_inode *ni, int sync);
 static inline size_t al_aligned(size_t size)
 {
-	return (size + 1023) & ~(size_t)1023;
+	return size_add(size, 1023) & ~(size_t)1023;
 }
 
 /* Globals from bitfunc.c */
@@ -528,7 +530,7 @@ int ni_insert_nonresident(struct ntfs_inode *ni, enum ATTR_TYPE type,
 			  const __le16 *name, u8 name_len,
 			  const struct runs_tree *run, CLST svcn, CLST len,
 			  __le16 flags, struct ATTRIB **new_attr,
-			  struct mft_inode **mi);
+			  struct mft_inode **mi, struct ATTR_LIST_ENTRY **le);
 int ni_insert_resident(struct ntfs_inode *ni, u32 data_size,
 		       enum ATTR_TYPE type, const __le16 *name, u8 name_len,
 		       struct ATTRIB **new_attr, struct mft_inode **mi,
@@ -574,9 +576,11 @@ int ni_rename(struct ntfs_inode *dir_ni, struct ntfs_inode *new_dir_ni,
 bool ni_is_dirty(struct inode *inode);
 
 /* Globals from fslog.c */
+bool check_index_header(const struct INDEX_HDR *hdr, size_t bytes);
 int log_replay(struct ntfs_inode *ni, bool *initialized);
 
 /* Globals from fsntfs.c */
+struct buffer_head *ntfs_bread(struct super_block *sb, sector_t block);
 bool ntfs_fix_pre_write(struct NTFS_RECORD_HEADER *rhdr, size_t bytes);
 int ntfs_fix_post_read(struct NTFS_RECORD_HEADER *rhdr, size_t bytes,
 		       bool simple);
@@ -589,10 +593,12 @@ int ntfs_look_for_free_space(struct ntfs_sb_info *sbi, CLST lcn, CLST len,
 			     enum ALLOCATE_OPT opt);
 int ntfs_look_free_mft(struct ntfs_sb_info *sbi, CLST *rno, bool mft,
 		       struct ntfs_inode *ni, struct mft_inode **mi);
-void ntfs_mark_rec_free(struct ntfs_sb_info *sbi, CLST rno);
+void ntfs_mark_rec_free(struct ntfs_sb_info *sbi, CLST rno, bool is_mft);
 int ntfs_clear_mft_tail(struct ntfs_sb_info *sbi, size_t from, size_t to);
 int ntfs_refresh_zone(struct ntfs_sb_info *sbi);
-int ntfs_update_mftmirr(struct ntfs_sb_info *sbi, int wait);
+void ntfs_update_mftmirr(struct ntfs_sb_info *sbi, int wait);
+void ntfs_bad_inode(struct inode *inode, const char *hint);
+#define _ntfs_bad_inode(i) ntfs_bad_inode(i, __func__)
 enum NTFS_DIRTY_FLAGS {
 	NTFS_DIRTY_CLEAR = 0,
 	NTFS_DIRTY_DIRTY = 1,
@@ -738,7 +744,6 @@ static inline struct ATTRIB *rec_find_attr_le(struct mft_inode *rec,
 int mi_write(struct mft_inode *mi, int wait);
 int mi_format_new(struct mft_inode *mi, struct ntfs_sb_info *sbi, CLST rno,
 		  __le16 flags, bool is_mft);
-void mi_mark_free(struct mft_inode *mi);
 struct ATTRIB *mi_insert_attr(struct mft_inode *mi, enum ATTR_TYPE type,
 			      const __le16 *name, u8 name_len, u32 asize,
 			      u16 name_off);
@@ -780,10 +785,10 @@ bool run_lookup_entry(const struct runs_tree *run, CLST vcn, CLST *lcn,
 void run_truncate(struct runs_tree *run, CLST vcn);
 void run_truncate_head(struct runs_tree *run, CLST vcn);
 void run_truncate_around(struct runs_tree *run, CLST vcn);
-bool run_lookup(const struct runs_tree *run, CLST vcn, size_t *Index);
 bool run_add_entry(struct runs_tree *run, CLST vcn, CLST lcn, CLST len,
 		   bool is_mft);
 bool run_collapse_range(struct runs_tree *run, CLST vcn, CLST len);
+bool run_insert_range(struct runs_tree *run, CLST vcn, CLST len);
 bool run_get_entry(const struct runs_tree *run, size_t index, CLST *vcn,
 		   CLST *lcn, CLST *len);
 bool run_is_mapped_full(const struct runs_tree *run, CLST svcn, CLST evcn);
@@ -792,16 +797,17 @@ int run_pack(const struct runs_tree *run, CLST svcn, CLST len, u8 *run_buf,
 	     u32 run_buf_size, CLST *packed_vcns);
 int run_unpack(struct runs_tree *run, struct ntfs_sb_info *sbi, CLST ino,
 	       CLST svcn, CLST evcn, CLST vcn, const u8 *run_buf,
-	       u32 run_buf_size);
+	       int run_buf_size);
 
 #ifdef NTFS3_CHECK_FREE_CLST
 int run_unpack_ex(struct runs_tree *run, struct ntfs_sb_info *sbi, CLST ino,
 		  CLST svcn, CLST evcn, CLST vcn, const u8 *run_buf,
-		  u32 run_buf_size);
+		  int run_buf_size);
 #else
 #define run_unpack_ex run_unpack
 #endif
 int run_get_highest_vcn(CLST vcn, const u8 *run_buf, u64 *highest_vcn);
+int run_clone(const struct runs_tree *run, struct runs_tree *new_run);
 
 /* Globals from super.c */
 void *ntfs_set_shared(void *ptr, u32 bytes);
@@ -1005,19 +1011,6 @@ static inline CLST bytes_to_cluster(const struct ntfs_sb_info *sbi, u64 size)
 static inline u64 bytes_to_block(const struct super_block *sb, u64 size)
 {
 	return (size + sb->s_blocksize - 1) >> sb->s_blocksize_bits;
-}
-
-static inline struct buffer_head *ntfs_bread(struct super_block *sb,
-					     sector_t block)
-{
-	struct buffer_head *bh = sb_bread(sb, block);
-
-	if (bh)
-		return bh;
-
-	ntfs_err(sb, "failed to read volume at offset 0x%llx",
-		 (u64)block << sb->s_blocksize_bits);
-	return NULL;
 }
 
 static inline struct ntfs_inode *ntfs_i(struct inode *inode)

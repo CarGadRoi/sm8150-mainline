@@ -288,7 +288,6 @@ void __init mem_init(void)
 #endif
 
 	high_memory = (void *) __va(max_low_pfn * PAGE_SIZE);
-	set_max_mapnr(max_pfn);
 
 	kasan_late_init();
 
@@ -302,13 +301,13 @@ void __init mem_init(void)
 		for (pfn = highmem_mapnr; pfn < max_mapnr; ++pfn) {
 			phys_addr_t paddr = (phys_addr_t)pfn << PAGE_SHIFT;
 			struct page *page = pfn_to_page(pfn);
-			if (!memblock_is_reserved(paddr))
+			if (memblock_is_memory(paddr) && !memblock_is_reserved(paddr))
 				free_highmem_page(page);
 		}
 	}
 #endif /* CONFIG_HIGHMEM */
 
-#if defined(CONFIG_PPC_FSL_BOOK3E) && !defined(CONFIG_SMP)
+#if defined(CONFIG_PPC_E500) && !defined(CONFIG_SMP)
 	/*
 	 * If smp is enabled, next_tlbcam_idx is initialized in the cpu up
 	 * functions.... do it here for the non-smp case.
