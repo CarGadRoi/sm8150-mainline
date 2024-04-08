@@ -1203,11 +1203,7 @@ static int ufs_qcom_init(struct ufs_hba *hba)
 	host->hba = hba;
 	ufshcd_set_variant(hba, host);
 
-	/*
-	 * Even though core_reset is required on all platforms, some DTs never
-	 * passed this property. So we have to keep it optional for supporting
-	 * them.
-	 */
+	/* Setup the optional reset control of HCI */
 	host->core_reset = devm_reset_control_get_optional(hba->dev, "rst");
 	if (IS_ERR(host->core_reset)) {
 		err = dev_err_probe(dev, PTR_ERR(host->core_reset),
